@@ -23,10 +23,6 @@ Thumbs.db
 # secrets
 .env
 
-# c++
-build*/
-cmake-build-*/
-*.o
-*.obj
-*.exe
-compile_commands.json
+# rust
+target/
+**/*.rs.bk

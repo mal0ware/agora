@@ -1,6 +1,6 @@
 # Agora
 
-**A limit order book in C++20 that rebuilds a full Nasdaq trading day from the exchange's own messages.**
+**A limit order book in Rust that rebuilds a full Nasdaq trading day from the exchange's own messages.**
 
 > **Status: planned.** This repository holds the design. No results exist yet, and nothing below is a finding. Each box in the roadmap gets ticked when the code and its tests are in.
 
@@ -43,9 +43,9 @@ The maths is tested before any result is trusted.
 ## Layout
 
 ```
-include/, src/     the order book, the parser, the replay tool
-tests/             Catch2 unit, property and golden tests
-bench/             throughput and latency benchmarks
+src/               the order book, the parser, the replay tool
+tests/             unit, property (proptest) and golden tests
+benches/           throughput and latency benchmarks (criterion)
 scripts/           fetch one sample day; reproduce the benchmark table
 results/           committed benchmark tables and charts
 PAPER.md           the specification and what was checked against it
