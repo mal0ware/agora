@@ -1,0 +1,32 @@
+# data is fetched, never committed
+data/
+*.parquet
+*.h5
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# secrets
+.env
+
+# c++
+build*/
+cmake-build-*/
+*.o
+*.obj
+*.exe
+compile_commands.json
