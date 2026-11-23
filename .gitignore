@@ -1,18 +1,9 @@
 # data is fetched, never committed
 data/
-*.parquet
-*.h5
 
-# python
-__pycache__/
-*.py[cod]
-.venv/
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-*.egg-info/
-dist/
-build/
+# rust
+target/
+**/*.rs.bk
 
 # editors and OS
 .vscode/
@@ -22,7 +13,3 @@ Thumbs.db
 
 # secrets
 .env
-
-# rust
-target/
-**/*.rs.bk
