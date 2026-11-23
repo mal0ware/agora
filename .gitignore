@@ -1,5 +1,5 @@
 # data is fetched, never committed
-data/
+/data/
 
 # rust
 target/
