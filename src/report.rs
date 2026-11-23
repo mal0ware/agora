@@ -113,6 +113,22 @@ pub fn invariants_csv(stats: &Stats, audit: &Audit, parse_errors: u64) -> String
         "executions_E_oldest_at_best_price",
         stats.exec_e_at_front.to_string(),
     );
+    row(
+        "executions_E_not_oldest_before_0930",
+        stats.exec_e_not_front_by_session[0].to_string(),
+    );
+    row(
+        "executions_E_not_oldest_0930_to_1600",
+        stats.exec_e_not_front_by_session[1].to_string(),
+    );
+    row(
+        "executions_E_not_oldest_after_1600",
+        stats.exec_e_not_front_by_session[2].to_string(),
+    );
+    row(
+        "executions_E_not_oldest_state_not_trading",
+        stats.exec_e_not_front_not_trading.to_string(),
+    );
     row("executions_C", stats.exec_c.to_string());
     row(
         "executions_C_at_best_price",

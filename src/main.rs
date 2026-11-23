@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use agora::hist::{ticks, Calibration, Histogram};
 use agora::itch::{parse, FrameReader, TYPES};
-use agora::replay::{Audit, Replay};
+use agora::replay::{Audit, ReplacePolicy, Replay};
 use agora::report::{self, LatencyRow};
 use agora::synth::{generate, SynthConfig};
 
@@ -26,8 +26,10 @@ const SMOKE: SynthConfig = SynthConfig {
 
 const USAGE: &str = "\
 usage:
-  agora replay <file> [--check] [--latency] [--limit N]
+  agora replay <file> [--check] [--latency] [--limit N] [--replace-keeps-priority]
       Rebuild every book from an ITCH 5.0 file (.gz is read directly).
+      --replace-keeps-priority measures an alternative reading of Order
+      Replace; see PAPER.md.
   agora synth <out> [--messages N] [--symbols N] [--seed N]
       Write a synthetic ITCH 5.0 stream.
   agora gunzip <in.gz> <out>
@@ -68,8 +70,12 @@ impl Pass {
 
 /// Read, parse and apply every message. This is the timed path.
 fn replay_pass(path: &Path, check: bool, limit: u64) -> Res<Pass> {
+    replay_pass_with(path, check, limit, ReplacePolicy::BackOfQueue)
+}
+
+fn replay_pass_with(path: &Path, check: bool, limit: u64, policy: ReplacePolicy) -> Res<Pass> {
     let mut frames = reader(path)?;
-    let mut replay = Replay::new(check);
+    let mut replay = Replay::new(check).with_policy(policy);
     let mut parse_errors = 0;
     let mut first_parse_error = None;
     let start = Instant::now();
@@ -286,7 +292,12 @@ fn cmd_replay(args: &[String]) -> Res<()> {
         return Ok(());
     }
     let check = flag(args, "--check");
-    let mut pass = replay_pass(&path, check, limit)?;
+    let policy = if flag(args, "--replace-keeps-priority") {
+        ReplacePolicy::KeepIfSamePriceAndNotLarger
+    } else {
+        ReplacePolicy::BackOfQueue
+    };
+    let mut pass = replay_pass_with(&path, check, limit, policy)?;
     let audit = check.then(|| pass.replay.finish());
     print_summary(&pass, audit.as_ref());
     Ok(())

@@ -36,6 +36,10 @@ books_crossed_at_end,0
 executions_E,8426
 executions_E_at_best_price,8426
 executions_E_oldest_at_best_price,8426
+executions_E_not_oldest_before_0930,0
+executions_E_not_oldest_0930_to_1600,0
+executions_E_not_oldest_after_1600,0
+executions_E_not_oldest_state_not_trading,0
 executions_C,575
 executions_C_at_best_price,575
 executions_C_oldest_at_best_price,575

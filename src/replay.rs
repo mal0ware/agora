@@ -114,6 +114,12 @@ pub struct Stats {
     pub exec_e_at_best: u64,
     /// `E` executions against the oldest order at the best price.
     pub exec_e_at_front: u64,
+    /// `E` executions that did not take the oldest order at the best price,
+    /// split into before 09:30, 09:30 to 16:00, and after.
+    pub exec_e_not_front_by_session: [u64; 3],
+    /// `E` executions that did not take the oldest order at the best price
+    /// while the stock's trading state was not `T`.
+    pub exec_e_not_front_not_trading: u64,
     /// `C` executions.
     pub exec_c: u64,
     /// `C` executions against an order at the best price on its side.
@@ -155,6 +161,8 @@ impl Default for Stats {
             exec_e: 0,
             exec_e_at_best: 0,
             exec_e_at_front: 0,
+            exec_e_not_front_by_session: [0; 3],
+            exec_e_not_front_not_trading: 0,
             exec_c: 0,
             exec_c_at_best: 0,
             exec_c_at_front: 0,
@@ -238,8 +246,31 @@ impl Audit {
     }
 }
 
+/// Where a replaced order goes in the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplacePolicy {
+    /// Every replacement joins the back of the queue at its price. This is
+    /// the default and the reading used for every published number.
+    #[default]
+    BackOfQueue,
+    /// A replacement at the same price for no more shares keeps its place.
+    /// An alternative reading, kept only to measure it against the data.
+    KeepIfSamePriceAndNotLarger,
+}
+
+fn session(ts: u64) -> usize {
+    if ts < OPEN_NS {
+        0
+    } else if ts < CLOSE_NS {
+        1
+    } else {
+        2
+    }
+}
+
 /// Replays ITCH messages into one book per stock locate.
 pub struct Replay {
+    policy: ReplacePolicy,
     books: Vec<Book>,
     symbols: Vec<Stock>,
     states: Vec<u8>,
@@ -257,6 +288,7 @@ impl Replay {
     /// checks; without it only the books and the cheap counters are kept.
     pub fn new(check: bool) -> Self {
         Replay {
+            policy: ReplacePolicy::BackOfQueue,
             books: Vec::new(),
             symbols: Vec::new(),
             states: Vec::new(),
@@ -266,6 +298,48 @@ impl Replay {
             stats: Stats::default(),
             examples: Vec::new(),
         }
+    }
+
+    /// Use a different rule for where replaced orders go.
+    pub fn with_policy(mut self, policy: ReplacePolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Apply a replace that keeps the order's place: same price, no more
+    /// shares. Returns false when the replace does not qualify.
+    fn replace_in_place(
+        &mut self,
+        m: &Message,
+        old_ref: u64,
+        new_ref: u64,
+        shares: u32,
+        price: u32,
+    ) -> bool {
+        let Some(&packed) = self.refs.get(&old_ref) else {
+            return false;
+        };
+        let locate = (packed >> 32) as usize;
+        let slot = packed as u32;
+        let old = self.books[locate].get(slot);
+        if price != old.price || shares == 0 || shares > old.qty || self.refs.contains_key(&new_ref)
+        {
+            return false;
+        }
+        if locate != usize::from(m.header.locate) {
+            self.stats.locate_mismatch += 1;
+        }
+        self.books[locate].reduce(slot, old.qty - shares);
+        self.books[locate].set_id(slot, new_ref);
+        self.refs.remove(&old_ref);
+        self.refs.insert(new_ref, packed);
+        self.stats.shares_replaced += u64::from(old.qty);
+        self.stats.shares_added += u64::from(shares);
+        self.stats.orders_added += 1;
+        if self.check {
+            self.after_update(locate, m.header.timestamp, b'U');
+        }
+        true
     }
 
     #[inline]
@@ -337,14 +411,7 @@ impl Replay {
                 if state == b'T' {
                     self.stats.crossed_episodes_trading += 1;
                 }
-                let session = if ts < OPEN_NS {
-                    0
-                } else if ts < CLOSE_NS {
-                    1
-                } else {
-                    2
-                };
-                self.stats.crossed_episodes_by_session[session] += 1;
+                self.stats.crossed_episodes_by_session[session(ts)] += 1;
                 if self.examples.len() < EXAMPLES {
                     self.examples.push(CrossExample {
                         timestamp: ts,
@@ -418,10 +485,16 @@ impl Replay {
             match m.body {
                 Body::OrderExecuted { .. } => {
                     self.stats.exec_e += 1;
-                    if book.at_best(slot) {
+                    let at_best = book.at_best(slot);
+                    if at_best {
                         self.stats.exec_e_at_best += 1;
-                        if book.at_head(slot) {
-                            self.stats.exec_e_at_front += 1;
+                    }
+                    if at_best && book.at_head(slot) {
+                        self.stats.exec_e_at_front += 1;
+                    } else {
+                        self.stats.exec_e_not_front_by_session[session(m.header.timestamp)] += 1;
+                        if self.states[locate] != b'T' {
+                            self.stats.exec_e_not_front_not_trading += 1;
                         }
                     }
                 }
@@ -515,6 +588,11 @@ impl Replay {
             } => {
                 // The replacement keeps the side and stock of the original
                 // (section 1.4.5) and joins the back of the queue at its price.
+                if self.policy == ReplacePolicy::KeepIfSamePriceAndNotLarger
+                    && self.replace_in_place(m, old_ref, new_ref, shares, price)
+                {
+                    return;
+                }
                 if let Some((taken, side)) = self.reduce(m, old_ref, None) {
                     self.stats.shares_replaced += u64::from(taken);
                     self.add(m, new_ref, side, shares, price);
@@ -693,6 +771,46 @@ mod tests {
             .map(|o| o.id)
             .collect();
         assert_eq!(ids, [2, 3]);
+    }
+
+    #[test]
+    fn the_alternative_replace_policy_keeps_the_place_only_when_it_should() {
+        let mut r = Replay::new(true).with_policy(ReplacePolicy::KeepIfSamePriceAndNotLarger);
+        r.apply(&add(1, 1, 1, Side::Sell, 10, 100));
+        r.apply(&add(1, 2, 2, Side::Sell, 10, 100));
+        let replace = |old_ref, new_ref, shares, price| {
+            msg(
+                1,
+                3,
+                Body::OrderReplace {
+                    old_ref,
+                    new_ref,
+                    shares,
+                    price,
+                },
+            )
+        };
+        let queue = |r: &Replay| -> Vec<(u64, u32)> {
+            r.book(1)
+                .unwrap()
+                .queue(Side::Sell, 100)
+                .map(|o| (o.id, o.qty))
+                .collect()
+        };
+        // Same price, fewer shares: order 1 keeps the front as order 3.
+        r.apply(&replace(1, 3, 6, 100));
+        assert_eq!(queue(&r), [(3, 6), (2, 10)]);
+        // More shares: back of the queue.
+        r.apply(&replace(3, 4, 7, 100));
+        assert_eq!(queue(&r), [(2, 10), (4, 7)]);
+        // New price: a new level.
+        r.apply(&replace(2, 5, 10, 101));
+        assert_eq!(queue(&r), [(4, 7)]);
+        assert_eq!(r.live_orders(), 2);
+        let audit = r.finish();
+        assert!(audit.conserved());
+        assert_eq!(r.stats.shares_added, 43);
+        assert_eq!(r.stats.shares_replaced, 26);
     }
 
     #[test]

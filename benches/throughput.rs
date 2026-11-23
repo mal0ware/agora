@@ -73,7 +73,7 @@ fn deep_book() -> (Book, Vec<u32>) {
         for k in 0..5u64 {
             let id = u64::from(level) * 10 + k;
             slots.push(book.add(id, Side::Buy, 10_000 - level, 100));
-            slots.push(book.add(id + 5, Side::Sell, 10_001 + level, 100));
+            slots.push(book.add(id + 5, Side::Sell, 10_003 + level, 100));
         }
     }
     (book, slots)
@@ -97,10 +97,8 @@ fn bench_book(c: &mut Criterion) {
     });
     group.bench_function("new_level_inside_spread_then_remove", |b| {
         let (mut book, _) = deep_book();
-        let front = book.front(Side::Sell).unwrap();
-        let _ = front;
         b.iter(|| {
-            let slot = book.add(u64::MAX, Side::Sell, black_box(10_001) - 1 + 1, 100);
+            let slot = book.add(u64::MAX, Side::Sell, black_box(10_001), 100);
             book.remove(slot)
         })
     });

@@ -210,6 +210,11 @@ impl Book {
         remaining
     }
 
+    /// Give a resting order a new identifier without moving it in its queue.
+    pub fn set_id(&mut self, slot: u32, id: u64) {
+        self.orders[slot as usize].id = id;
+    }
+
     /// Remove a resting order outright. Returns the quantity it still had.
     pub fn remove(&mut self, slot: u32) -> u32 {
         let qty = self.orders[slot as usize].qty;

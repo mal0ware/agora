@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 796 412" width="796" height="412" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="Time to parse and apply one ITCH message, by type">
+<rect width="796" height="412" fill="#fcfcfb"/>
+<text x="16" y="28" font-size="16" font-weight="600" fill="#0b0b0b">Time to parse and apply one ITCH message, by type</text>
+<text x="16" y="48" font-size="12" fill="#52514e">12302019.NASDAQ_ITCH50: 268744780 messages, one core. Median replay of the day: 54.6 s.</text>
+<circle cx="241.0" cy="70.0" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="251.0" y="74" font-size="12" fill="#52514e">p50</text>
+<rect x="306.5" y="65.5" width="9" height="9" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="321.0" y="74" font-size="12" fill="#52514e">p99</text>
+<path d="M381.0 64.0 L387.0 75.0 L375.0 75.0 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="391.0" y="74" font-size="12" fill="#52514e">p99.9</text>
+<text x="628.0" y="74" font-size="12" fill="#52514e" text-anchor="end">p50</text>
+<text x="704.0" y="74" font-size="12" fill="#52514e" text-anchor="end">p99</text>
+<text x="780.0" y="74" font-size="12" fill="#52514e" text-anchor="end">p99.9</text>
+<line x1="236.0" y1="88.0" x2="236.0" y2="368.0" stroke="#e4e3df" stroke-width="1"/>
+<text x="236.0" y="384.0" font-size="11" fill="#52514e" text-anchor="middle">10 ns</text>
+<line x1="336.0" y1="88.0" x2="336.0" y2="368.0" stroke="#e4e3df" stroke-width="1"/>
+<text x="336.0" y="384.0" font-size="11" fill="#52514e" text-anchor="middle">100 ns</text>
+<line x1="436.0" y1="88.0" x2="436.0" y2="368.0" stroke="#e4e3df" stroke-width="1"/>
+<text x="436.0" y="384.0" font-size="11" fill="#52514e" text-anchor="middle">1.00 µs</text>
+<line x1="536.0" y1="88.0" x2="536.0" y2="368.0" stroke="#e4e3df" stroke-width="1"/>
+<text x="536.0" y="384.0" font-size="11" fill="#52514e" text-anchor="middle">10.0 µs</text>
+<text x="386.0" y="402.0" font-size="11" fill="#52514e" text-anchor="middle">time to parse and apply one message (log scale)</text>
+<text x="16" y="112.0" font-size="13" fill="#0b0b0b">Add order (A)</text>
+<text x="16" y="125.0" font-size="10.5" fill="#52514e">117,145,568 messages</text>
+<line x1="344.9" y1="113.0" x2="425.8" y2="113.0" stroke="#52514e" stroke-opacity="0.45" stroke-width="2"/>
+<circle cx="344.9" cy="113.0" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="628.0" y="117.0" font-size="12" fill="#0b0b0b" text-anchor="end">123 ns</text>
+<rect x="399.7" y="108.5" width="9" height="9" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="704.0" y="117.0" font-size="12" fill="#0b0b0b" text-anchor="end">481 ns</text>
+<path d="M425.8 107.0 L431.8 118.0 L419.8 118.0 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="780.0" y="117.0" font-size="12" fill="#0b0b0b" text-anchor="end">791 ns</text>
+<text x="16" y="146.0" font-size="13" fill="#0b0b0b">Add order, attributed (F)</text>
+<text x="16" y="159.0" font-size="10.5" fill="#52514e">1,485,888 messages</text>
+<line x1="344.0" y1="147.0" x2="450.9" y2="147.0" stroke="#52514e" stroke-opacity="0.45" stroke-width="2"/>
+<circle cx="344.0" cy="147.0" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="628.0" y="151.0" font-size="12" fill="#0b0b0b" text-anchor="end">120 ns</text>
+<rect x="403.4" y="142.5" width="9" height="9" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="704.0" y="151.0" font-size="12" fill="#0b0b0b" text-anchor="end">524 ns</text>
+<path d="M450.9 141.0 L456.9 152.0 L444.9 152.0 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="780.0" y="151.0" font-size="12" fill="#0b0b0b" text-anchor="end">1.41 µs</text>
+<text x="16" y="180.0" font-size="13" fill="#0b0b0b">Execute (E)</text>
+<text x="16" y="193.0" font-size="10.5" fill="#52514e">5,722,824 messages</text>
+<line x1="349.4" y1="181.0" x2="436.2" y2="181.0" stroke="#52514e" stroke-opacity="0.45" stroke-width="2"/>
+<circle cx="349.4" cy="181.0" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="628.0" y="185.0" font-size="12" fill="#0b0b0b" text-anchor="end">136 ns</text>
+<rect x="417.6" y="176.5" width="9" height="9" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="704.0" y="185.0" font-size="12" fill="#0b0b0b" text-anchor="end">726 ns</text>
+<path d="M436.2 175.0 L442.2 186.0 L430.2 186.0 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="780.0" y="185.0" font-size="12" fill="#0b0b0b" text-anchor="end">1.00 µs</text>
+<text x="16" y="214.0" font-size="13" fill="#0b0b0b">Execute with price (C)</text>
+<text x="16" y="227.0" font-size="10.5" fill="#52514e">99,917 messages</text>
+<line x1="334.3" y1="215.0" x2="436.2" y2="215.0" stroke="#52514e" stroke-opacity="0.45" stroke-width="2"/>
+<circle cx="334.3" cy="215.0" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="628.0" y="219.0" font-size="12" fill="#0b0b0b" text-anchor="end">96 ns</text>
+<rect x="417.6" y="210.5" width="9" height="9" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="704.0" y="219.0" font-size="12" fill="#0b0b0b" text-anchor="end">726 ns</text>
+<path d="M436.2 209.0 L442.2 220.0 L430.2 220.0 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="780.0" y="219.0" font-size="12" fill="#0b0b0b" text-anchor="end">1.00 µs</text>
+<text x="16" y="248.0" font-size="13" fill="#0b0b0b">Partial cancel (X)</text>
+<text x="16" y="261.0" font-size="10.5" fill="#52514e">2,787,676 messages</text>
+<line x1="309.8" y1="249.0" x2="434.3" y2="249.0" stroke="#52514e" stroke-opacity="0.45" stroke-width="2"/>
+<circle cx="309.8" cy="249.0" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="628.0" y="253.0" font-size="12" fill="#0b0b0b" text-anchor="end">55 ns</text>
+<rect x="412.2" y="244.5" width="9" height="9" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="704.0" y="253.0" font-size="12" fill="#0b0b0b" text-anchor="end">641 ns</text>
+<path d="M434.3 243.0 L440.3 254.0 L428.3 254.0 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="780.0" y="253.0" font-size="12" fill="#0b0b0b" text-anchor="end">962 ns</text>
+<text x="16" y="282.0" font-size="13" fill="#0b0b0b">Delete (D)</text>
+<text x="16" y="295.0" font-size="10.5" fill="#52514e">114,360,997 messages</text>
+<line x1="369.0" y1="283.0" x2="444.6" y2="283.0" stroke="#52514e" stroke-opacity="0.45" stroke-width="2"/>
+<circle cx="369.0" cy="283.0" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="628.0" y="287.0" font-size="12" fill="#0b0b0b" text-anchor="end">214 ns</text>
+<rect x="423.6" y="278.5" width="9" height="9" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="704.0" y="287.0" font-size="12" fill="#0b0b0b" text-anchor="end">833 ns</text>
+<path d="M444.6 277.0 L450.6 288.0 L438.6 288.0 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="780.0" y="287.0" font-size="12" fill="#0b0b0b" text-anchor="end">1.22 µs</text>
+<text x="16" y="316.0" font-size="13" fill="#0b0b0b">Replace (U)</text>
+<text x="16" y="329.0" font-size="10.5" fill="#52514e">21,639,067 messages</text>
+<line x1="389.4" y1="317.0" x2="472.3" y2="317.0" stroke="#52514e" stroke-opacity="0.45" stroke-width="2"/>
+<circle cx="389.4" cy="317.0" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="628.0" y="321.0" font-size="12" fill="#0b0b0b" text-anchor="end">342 ns</text>
+<rect x="443.7" y="312.5" width="9" height="9" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="704.0" y="321.0" font-size="12" fill="#0b0b0b" text-anchor="end">1.32 µs</text>
+<path d="M472.3 311.0 L478.3 322.0 L466.3 322.0 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="780.0" y="321.0" font-size="12" fill="#0b0b0b" text-anchor="end">2.31 µs</text>
+<text x="16" y="350.0" font-size="13" fill="#0b0b0b">No book change (all other)</text>
+<text x="16" y="363.0" font-size="10.5" fill="#52514e">5,502,843 messages</text>
+<line x1="256.5" y1="351.0" x2="357.9" y2="351.0" stroke="#52514e" stroke-opacity="0.45" stroke-width="2"/>
+<circle cx="256.5" cy="351.0" r="5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="628.0" y="355.0" font-size="12" fill="#0b0b0b" text-anchor="end">16 ns</text>
+<rect x="311.3" y="346.5" width="9" height="9" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="704.0" y="355.0" font-size="12" fill="#0b0b0b" text-anchor="end">63 ns</text>
+<path d="M357.9 345.0 L363.9 356.0 L351.9 356.0 Z" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="780.0" y="355.0" font-size="12" fill="#0b0b0b" text-anchor="end">166 ns</text>
+</svg>
