@@ -7,6 +7,7 @@
 //! - [`replay`]: rebuilds every book from a message stream and checks it.
 //! - [`synth`]: a seeded generator of valid ITCH streams for tests.
 //! - [`hist`]: a cycle clock and a histogram for latency percentiles.
+//! - [`pin`]: pins the benchmark thread to one CPU.
 //! - [`report`]: the tables and the chart written by the reproduce command.
 
 #![warn(missing_docs)]
@@ -15,6 +16,7 @@ pub mod book;
 pub mod engine;
 pub mod hist;
 pub mod itch;
+pub mod pin;
 pub mod replay;
 pub mod report;
 pub mod synth;

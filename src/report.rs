@@ -144,7 +144,6 @@ pub fn invariants_csv(stats: &Stats, audit: &Audit, parse_errors: u64) -> String
         stats.non_printable_shares.to_string(),
     );
     row("cross_shares", stats.cross_shares.to_string());
-    row("book_digest", format!("{:016x}", audit.digest));
     out
 }
 

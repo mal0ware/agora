@@ -49,6 +49,9 @@ impl Hasher for RefHasher {
 
 type RefMap = HashMap<u64, u64, BuildHasherDefault<RefHasher>>;
 
+/// The order reference index: a hash map from reference to stock and slot.
+pub type RefIndex = RefMap;
+
 /// Counters kept while replaying.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stats {
@@ -373,6 +376,20 @@ impl Replay {
     /// Every book with its stock locate.
     pub fn books(&self) -> impl Iterator<Item = (u16, &Book)> {
         self.books.iter().enumerate().map(|(i, b)| (i as u16, b))
+    }
+
+    /// Where an order rests: its stock locate and slot.
+    pub fn locate_order(&self, order_ref: u64) -> Option<(u16, u32)> {
+        self.refs
+            .get(&order_ref)
+            .map(|&p| ((p >> 32) as u16, p as u32))
+    }
+
+    /// Move an order to the front of its queue (analysis only).
+    pub fn promote(&mut self, order_ref: u64) {
+        if let Some((loc, slot)) = self.locate_order(order_ref) {
+            self.books[usize::from(loc)].move_to_front(slot);
+        }
     }
 
     /// Orders resting across all books.

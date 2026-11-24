@@ -17,6 +17,7 @@ const BUCKETS: usize = LINEAR as usize + (64 - 6) * (1 << SUB_BITS);
 pub struct Histogram {
     counts: Vec<u64>,
     total: u64,
+    sum: u128,
     max: u64,
 }
 
@@ -53,6 +54,7 @@ impl Histogram {
         Histogram {
             counts: vec![0; BUCKETS],
             total: 0,
+            sum: 0,
             max: 0,
         }
     }
@@ -62,6 +64,7 @@ impl Histogram {
     pub fn record(&mut self, v: u64) {
         self.counts[bucket_of(v)] += 1;
         self.total += 1;
+        self.sum += u128::from(v);
         if v > self.max {
             self.max = v;
         }
@@ -77,8 +80,22 @@ impl Histogram {
         self.max
     }
 
-    /// The value at quantile `q` in `0.0..=1.0`: the lower edge of the bucket
-    /// holding the `ceil(q * count)`-th smallest value. Zero when empty.
+    /// Mean of the values recorded, exact. Zero when empty.
+    pub fn mean(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.sum as f64 / self.total as f64
+        }
+    }
+
+    /// The value at quantile `q` in `0.0..=1.0`: the middle of the bucket
+    /// holding the `ceil(q * count)`-th smallest value, never above the
+    /// largest value recorded. Zero when empty.
+    ///
+    /// Values below 64 have a bucket each, so they are exact. Above that a
+    /// bucket is 1/32 of its lower edge wide and the middle is at most 1.6%
+    /// from any value in it.
     pub fn quantile(&self, q: f64) -> u64 {
         if self.total == 0 {
             return 0;
@@ -88,7 +105,13 @@ impl Histogram {
         for (i, &c) in self.counts.iter().enumerate() {
             seen += c;
             if seen >= rank {
-                return bucket_low(i).min(self.max);
+                let low = bucket_low(i);
+                let high = if i + 1 < BUCKETS {
+                    bucket_low(i + 1) - 1
+                } else {
+                    u64::MAX
+                };
+                return (low + (high - low) / 2).min(self.max);
             }
         }
         self.max
@@ -100,6 +123,7 @@ impl Histogram {
             *a += b;
         }
         self.total += other.total;
+        self.sum += other.sum;
         self.max = self.max.max(other.max);
     }
 }
@@ -187,8 +211,25 @@ mod tests {
         for q in [0.5, 0.9, 0.99, 0.999] {
             let exact = q * 100_000.0;
             let got = h.quantile(q) as f64;
-            assert!(got <= exact && got >= exact * (1.0 - 1.0 / 32.0), "{q}");
+            assert!((got - exact).abs() <= exact / 60.0, "{q}: {got} vs {exact}");
         }
+        assert_eq!(h.mean(), 50_000.5);
+    }
+
+    #[test]
+    fn a_quantile_is_the_middle_of_its_bucket() {
+        // 1000..=1023 share one bucket (32 per power of two above 512 is 16
+        // wide: 1008..=1023). Every value in it reports the same middle.
+        let mut h = Histogram::new();
+        h.record(1008);
+        h.record(1023);
+        h.record(5000);
+        assert_eq!(h.quantile(0.3), 1015);
+        assert_eq!(h.quantile(0.6), 1015);
+        // The top bucket is cut at the largest value seen.
+        let mut one = Histogram::new();
+        one.record(1009);
+        assert_eq!(one.quantile(1.0), 1009);
     }
 
     #[test]

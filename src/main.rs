@@ -8,8 +8,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use agora::hist::{ticks, Calibration, Histogram};
-use agora::itch::{parse, FrameReader, TYPES};
-use agora::replay::{Audit, ReplacePolicy, Replay};
+use agora::itch::{parse, Body, FrameReader, TYPES};
+use agora::pin::pin_to_cpu;
+use agora::replay::{Audit, RefIndex, ReplacePolicy, Replay, Stats};
 use agora::report::{self, LatencyRow};
 use agora::synth::{generate, SynthConfig};
 
@@ -34,9 +35,10 @@ usage:
       Write a synthetic ITCH 5.0 stream.
   agora gunzip <in.gz> <out>
       Decompress a sample file.
-  agora reproduce [--fast] [--data FILE] [--out DIR] [--runs N]
+  agora reproduce [--fast] [--data FILE] [--out DIR] [--runs N] [--cpu N]
       Rebuild results/. --fast uses the committed synthetic stream and
-      writes results/smoke/.
+      writes results/smoke/. The full run pins itself to logical CPU N
+      (default 2) and times every pass --runs times (default 10).
 ";
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -54,12 +56,35 @@ fn reader(path: &Path) -> io::Result<FrameReader<Box<dyn Read>>> {
     Ok(FrameReader::with_capacity(open(path)?, 4 << 20))
 }
 
+/// Times of day at which the full run fingerprints every book.
+const CHECKPOINTS: [(&str, u64); 8] = [
+    ("07:00:00", 7 * 3600),
+    ("09:30:00", 9 * 3600 + 1800),
+    ("09:35:00", 9 * 3600 + 2100),
+    ("11:00:00", 11 * 3600),
+    ("13:00:00", 13 * 3600),
+    ("15:00:00", 15 * 3600),
+    ("16:00:00", 16 * 3600),
+    ("18:00:00", 18 * 3600),
+];
+
+/// The state of every book just before the first message at or after a
+/// time of day.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Checkpoint {
+    label: &'static str,
+    messages: u64,
+    resting_orders: u64,
+    digest: u64,
+}
+
 /// What one pass over a file produced.
 struct Pass {
     replay: Replay,
     seconds: f64,
     parse_errors: u64,
     first_parse_error: Option<String>,
+    checkpoints: Vec<Checkpoint>,
 }
 
 impl Pass {
@@ -70,14 +95,28 @@ impl Pass {
 
 /// Read, parse and apply every message. This is the timed path.
 fn replay_pass(path: &Path, check: bool, limit: u64) -> Res<Pass> {
-    replay_pass_with(path, check, limit, ReplacePolicy::BackOfQueue)
+    replay_pass_with(path, check, limit, ReplacePolicy::BackOfQueue, false)
 }
 
-fn replay_pass_with(path: &Path, check: bool, limit: u64, policy: ReplacePolicy) -> Res<Pass> {
+fn replay_pass_with(
+    path: &Path,
+    check: bool,
+    limit: u64,
+    policy: ReplacePolicy,
+    mark: bool,
+) -> Res<Pass> {
     let mut frames = reader(path)?;
     let mut replay = Replay::new(check).with_policy(policy);
     let mut parse_errors = 0;
     let mut first_parse_error = None;
+    let mut checkpoints = Vec::new();
+    // With checkpoints off this stays at the maximum and the test below is
+    // one never-taken branch per message.
+    let mut next_mark = if mark {
+        CHECKPOINTS[0].1 * 1_000_000_000
+    } else {
+        u64::MAX
+    };
     let start = Instant::now();
     let mut seen = 0;
     while seen < limit {
@@ -86,7 +125,21 @@ fn replay_pass_with(path: &Path, check: bool, limit: u64, policy: ReplacePolicy)
         };
         seen += 1;
         match parse(frame) {
-            Ok(m) => replay.apply(&m),
+            Ok(m) => {
+                while m.header.timestamp >= next_mark {
+                    let (label, _) = CHECKPOINTS[checkpoints.len()];
+                    checkpoints.push(Checkpoint {
+                        label,
+                        messages: replay.stats.messages,
+                        resting_orders: replay.live_orders() as u64,
+                        digest: replay.digest(),
+                    });
+                    next_mark = CHECKPOINTS
+                        .get(checkpoints.len())
+                        .map_or(u64::MAX, |c| c.1 * 1_000_000_000);
+                }
+                replay.apply(&m)
+            }
             Err(e) => {
                 parse_errors += 1;
                 if first_parse_error.is_none() {
@@ -100,7 +153,22 @@ fn replay_pass_with(path: &Path, check: bool, limit: u64, policy: ReplacePolicy)
         seconds: start.elapsed().as_secs_f64(),
         parse_errors,
         first_parse_error,
+        checkpoints,
     })
+}
+
+/// Read every frame without parsing it. Returns the message count and the
+/// seconds taken.
+fn frames_pass(path: &Path) -> Res<(u64, f64)> {
+    let mut frames = reader(path)?;
+    let start = Instant::now();
+    let (mut n, mut sink) = (0u64, 0u64);
+    while let Some(frame) = frames.next_frame()? {
+        n += 1;
+        sink = sink.wrapping_add(u64::from(std::hint::black_box(frame)[0]));
+    }
+    std::hint::black_box(sink);
+    Ok((n, start.elapsed().as_secs_f64()))
 }
 
 /// Read and parse every message without touching a book. Returns the message
@@ -119,14 +187,53 @@ fn parse_pass(path: &Path) -> Res<(u64, f64)> {
     Ok((n, start.elapsed().as_secs_f64()))
 }
 
+/// Read, parse and do only the order-reference lookups a replay would do:
+/// insert on add, look up on execute and cancel, remove on delete, both on
+/// replace. No book is touched. An order that an execution or a cancel
+/// empties stays in the index here, because only a book knows it is empty;
+/// that is about 2% of the day's orders.
+fn index_pass(path: &Path) -> Res<(u64, f64)> {
+    let mut frames = reader(path)?;
+    let mut refs = RefIndex::default();
+    let start = Instant::now();
+    let (mut n, mut sink) = (0u64, 0u64);
+    while let Some(frame) = frames.next_frame()? {
+        n += 1;
+        let Ok(m) = parse(frame) else { continue };
+        match m.body {
+            Body::AddOrder { order_ref, .. } => {
+                refs.insert(order_ref, n);
+            }
+            Body::OrderExecuted { order_ref, .. }
+            | Body::OrderExecutedWithPrice { order_ref, .. }
+            | Body::OrderCancel { order_ref, .. } => {
+                sink = sink.wrapping_add(refs.get(&order_ref).copied().unwrap_or(0));
+            }
+            Body::OrderDelete { order_ref } => {
+                sink = sink.wrapping_add(refs.remove(&order_ref).unwrap_or(0));
+            }
+            Body::OrderReplace {
+                old_ref, new_ref, ..
+            } => {
+                sink = sink.wrapping_add(refs.remove(&old_ref).unwrap_or(0));
+                refs.insert(new_ref, n);
+            }
+            _ => {}
+        }
+    }
+    std::hint::black_box(sink);
+    Ok((n, start.elapsed().as_secs_f64()))
+}
+
 /// Time each message from before parse to after apply, by message type.
 /// Returns one histogram per type byte, in ticks, the nanoseconds per tick,
 /// and the cost of an empty measurement in ticks.
-fn latency_pass(path: &Path) -> Res<(Vec<Histogram>, f64, Histogram)> {
+fn latency_pass(path: &Path) -> Res<(Vec<Histogram>, f64, Histogram, f64)> {
     let mut frames = reader(path)?;
     let mut replay = Replay::new(false);
     let mut hists = vec![Histogram::new(); 256];
     let cal = Calibration::start();
+    let start = Instant::now();
     while let Some(frame) = frames.next_frame()? {
         let t0 = ticks();
         if let Ok(m) = parse(frame) {
@@ -135,6 +242,7 @@ fn latency_pass(path: &Path) -> Res<(Vec<Histogram>, f64, Histogram)> {
         let t1 = ticks();
         hists[usize::from(frame[0])].record(t1.wrapping_sub(t0));
     }
+    let seconds = start.elapsed().as_secs_f64();
     let ns_per_tick = cal.ns_per_tick();
     let mut floor = Histogram::new();
     for _ in 0..1_000_000 {
@@ -142,7 +250,7 @@ fn latency_pass(path: &Path) -> Res<(Vec<Histogram>, f64, Histogram)> {
         let t1 = ticks();
         floor.record(t1.wrapping_sub(t0));
     }
-    Ok((hists, ns_per_tick, floor))
+    Ok((hists, ns_per_tick, floor, seconds))
 }
 
 fn latency_row(label: &str, h: &Histogram, ns_per_tick: f64) -> LatencyRow {
@@ -284,7 +392,7 @@ fn cmd_replay(args: &[String]) -> Res<()> {
     let path = PathBuf::from(args.first().ok_or("replay needs a file")?);
     let limit = value::<u64>(args, "--limit")?.unwrap_or(u64::MAX);
     if flag(args, "--latency") {
-        let (hists, ns_per_tick, floor) = latency_pass(&path)?;
+        let (hists, ns_per_tick, floor, _) = latency_pass(&path)?;
         print!(
             "{}",
             report::latency_csv(&latency_rows(&hists, ns_per_tick, &floor))
@@ -297,7 +405,7 @@ fn cmd_replay(args: &[String]) -> Res<()> {
     } else {
         ReplacePolicy::BackOfQueue
     };
-    let mut pass = replay_pass_with(&path, check, limit, policy)?;
+    let mut pass = replay_pass_with(&path, check, limit, policy, false)?;
     let audit = check.then(|| pass.replay.finish());
     print_summary(&pass, audit.as_ref());
     Ok(())
@@ -346,9 +454,17 @@ fn cmd_gunzip(args: &[String]) -> Res<()> {
     Ok(())
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
+/// Smallest, median and largest of a set of timings.
+fn spread(v: &[f64]) -> (f64, f64, f64) {
+    let mut v = v.to_vec();
     v.sort_by(f64::total_cmp);
-    v[v.len() / 2]
+    let n = v.len();
+    let median = if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    };
+    (v[0], median, v[n - 1])
 }
 
 /// The smoke run: replay the committed synthetic stream with every check on,
@@ -372,7 +488,7 @@ fn reproduce_fast(out: &Path) -> Res<()> {
         "unchecked replay: {:.2} million messages per second (tiny file; not a benchmark)",
         unchecked.rate() / 1e6
     );
-    let (hists, ns_per_tick, floor) = latency_pass(path)?;
+    let (hists, ns_per_tick, floor, _) = latency_pass(path)?;
     let rows = latency_rows(&hists, ns_per_tick, &floor);
     let all = &rows[rows.len() - 2];
     println!(
@@ -384,10 +500,9 @@ fn reproduce_fast(out: &Path) -> Res<()> {
     fs::create_dir_all(out)?;
     let s = &pass.replay.stats;
     write(&out.join("messages_by_type.csv"), &report::messages_csv(s))?;
-    write(
-        &out.join("invariants.csv"),
-        &report::invariants_csv(s, &audit, pass.parse_errors),
-    )?;
+    let mut invariants = report::invariants_csv(s, &audit, pass.parse_errors);
+    invariants.push_str(&format!("book_digest,{:016x}\n", audit.digest));
+    write(&out.join("invariants.csv"), &invariants)?;
 
     let mut failures = Vec::new();
     if pass.parse_errors > 0 {
@@ -419,8 +534,32 @@ fn reproduce_fast(out: &Path) -> Res<()> {
     }
 }
 
+/// The passes timed in every round of the full run, in the order they run.
+const PASSES: [&str; 6] = [
+    "read_frames_only",
+    "read_and_parse",
+    "read_parse_and_order_lookup",
+    "replay",
+    "replay_with_checks",
+    "replay_with_per_message_timing",
+];
+
+/// The numbers every replay of one file must agree on.
+fn ledger(s: &Stats) -> [u64; 8] {
+    [
+        s.messages,
+        s.orders_added,
+        s.shares_added,
+        s.shares_executed,
+        s.shares_cancelled,
+        s.shares_deleted,
+        s.shares_replaced,
+        s.peak_live_orders,
+    ]
+}
+
 /// The full run on one real day.
-fn reproduce_full(data: &Path, out: &Path, runs: usize) -> Res<()> {
+fn reproduce_full(data: &Path, out: &Path, runs: usize, cpu: usize) -> Res<()> {
     if !data.exists() {
         let gz = PathBuf::from(format!("{}.gz", data.display()));
         if !gz.exists() {
@@ -436,76 +575,152 @@ fn reproduce_full(data: &Path, out: &Path, runs: usize) -> Res<()> {
     }
     let file_bytes = fs::metadata(data)?.len();
     fs::create_dir_all(out)?;
+    let pinned = pin_to_cpu(cpu);
+    println!("pinned to cpu {cpu}: {pinned}");
 
-    // Parse only. This pass also pulls the file into the page cache.
-    println!("parse-only pass ...");
+    // Warm-up, not timed: two parse passes pull the file into the page
+    // cache, then one full replay. The warm-up replay also takes the
+    // intraday checkpoints.
+    println!("warm-up ...");
     parse_pass(data)?;
-    let (n_parse, parse_seconds) = parse_pass(data)?;
-    println!("parse only: {n_parse} messages in {parse_seconds:.3} s");
+    parse_pass(data)?;
+    let warm = replay_pass_with(data, false, u64::MAX, ReplacePolicy::BackOfQueue, true)?;
 
-    let mut timing =
-        String::from("pass,messages,seconds,million_messages_per_second,ns_per_message\n");
-    let mut line = |name: &str, n: u64, secs: f64| {
-        timing.push_str(&format!(
-            "{name},{n},{secs:.3},{:.3},{:.1}\n",
-            n as f64 / secs / 1e6,
-            secs * 1e9 / n as f64
-        ));
-    };
-    line("read_and_parse_only", n_parse, parse_seconds);
-
-    let mut seconds = Vec::new();
-    let mut digest = 0;
-    for run in 1..=runs {
-        println!("replay pass {run} of {runs} ...");
-        let pass = replay_pass(data, false, u64::MAX)?;
-        print_summary(&pass, None);
-        line(
-            &format!("replay_run_{run}"),
-            pass.replay.stats.messages,
-            pass.seconds,
-        );
-        seconds.push(pass.seconds);
-        digest = pass.replay.digest();
-    }
-    let median_seconds = median(seconds);
-    line("replay_median", n_parse, median_seconds);
-
+    // The pass every count and invariant comes from. Not timed.
     println!("checked pass ...");
-    let mut checked = replay_pass(data, true, u64::MAX)?;
+    let mut checked = replay_pass_with(data, true, u64::MAX, ReplacePolicy::BackOfQueue, true)?;
     let audit = checked.replay.finish();
     print_summary(&checked, Some(&audit));
-    line(
-        "replay_with_checks",
-        checked.replay.stats.messages,
-        checked.seconds,
-    );
-    if audit.digest != digest {
-        return Err("checked and unchecked replays built different books".into());
+    if checked.checkpoints != warm.checkpoints {
+        return Err("checked and unchecked replays differ at a checkpoint".into());
     }
+    let expected = ledger(&checked.replay.stats);
+    let n = checked.replay.stats.messages;
 
-    println!("latency pass ...");
-    let start = Instant::now();
-    let (hists, ns_per_tick, floor) = latency_pass(data)?;
-    line(
-        "replay_with_per_message_timing",
-        n_parse,
-        start.elapsed().as_secs_f64(),
-    );
+    // Timed rounds. Each round runs every pass once, so slow drift on the
+    // machine lands on all of them alike.
+    let mut times: Vec<Vec<f64>> = vec![Vec::new(); PASSES.len()];
+    let mut latency = None;
+    for round in 1..=runs {
+        println!("round {round} of {runs} ...");
+        times[0].push(frames_pass(data)?.1);
+        times[1].push(parse_pass(data)?.1);
+        times[2].push(index_pass(data)?.1);
+        for (slot, check) in [(3, false), (4, true)] {
+            let pass = replay_pass(data, check, u64::MAX)?;
+            if ledger(&pass.replay.stats) != expected {
+                return Err("a timed replay disagrees with the checked pass".into());
+            }
+            times[slot].push(pass.seconds);
+        }
+        let (hists, ns_per_tick, floor, seconds) = latency_pass(data)?;
+        times[5].push(seconds);
+        latency = Some((hists, ns_per_tick, floor));
+        println!(
+            "  replay {:.3} s, with checks {:.3} s, with timing {:.3} s",
+            times[3][round - 1],
+            times[4][round - 1],
+            times[5][round - 1]
+        );
+    }
+    let (hists, ns_per_tick, floor) = latency.ok_or("no rounds were run")?;
 
     println!("first-million pass ...");
     let mut first = replay_pass(data, true, 1_000_000)?;
     let first_audit = first.replay.finish();
 
+    let mut throughput = String::from(
+        "pass,runs,min_seconds,median_seconds,max_seconds,spread_percent,median_ns_per_message,median_million_messages_per_second\n",
+    );
+    let mut each = String::from("round,pass,seconds\n");
+    let mut medians = Vec::new();
+    for (name, t) in PASSES.iter().zip(&times) {
+        let (lo, mid, hi) = spread(t);
+        medians.push(mid);
+        throughput.push_str(&format!(
+            "{name},{},{lo:.3},{mid:.3},{hi:.3},{:.1},{:.1},{:.3}\n",
+            t.len(),
+            (hi - lo) / mid * 100.0,
+            mid * 1e9 / n as f64,
+            n as f64 / mid / 1e6
+        ));
+        for (i, secs) in t.iter().enumerate() {
+            each.push_str(&format!("{},{name},{secs:.3}\n", i + 1));
+        }
+    }
+    let per_message = |secs: f64| secs * 1e9 / n as f64;
+    let mut profile = String::from("stage,median_seconds,ns_per_message,share_of_replay\n");
+    let stages = [
+        ("read the file and split it into messages", medians[0]),
+        ("parse", medians[1] - medians[0]),
+        ("order reference lookup", medians[2] - medians[1]),
+        ("book update and counters", medians[3] - medians[2]),
+        ("whole replay", medians[3]),
+    ];
+    for (name, secs) in stages {
+        profile.push_str(&format!(
+            "{name},{secs:.3},{:.1},{:.3}\n",
+            per_message(secs),
+            secs / medians[3]
+        ));
+    }
+
+    let rows = latency_rows(&hists, ns_per_tick, &floor);
+    let mut all = Histogram::new();
+    for h in &hists {
+        all.merge(h);
+    }
+    let mut timer = String::from("measure,value\n");
+    let mut row = |k: &str, v: String| timer.push_str(&format!("{k},{v}\n"));
+    row(
+        "pinned_cpu",
+        if pinned {
+            cpu.to_string()
+        } else {
+            "not pinned".into()
+        },
+    );
+    row("rounds", runs.to_string());
+    row(
+        "replay_median_ns_per_message",
+        format!("{:.1}", per_message(medians[3])),
+    );
+    row(
+        "replay_with_per_message_timing_median_ns_per_message",
+        format!("{:.1}", per_message(medians[5])),
+    );
+    row(
+        "timing_cost_ns_per_message",
+        format!("{:.1}", per_message(medians[5] - medians[3])),
+    );
+    row(
+        "mean_measured_latency_ns",
+        format!("{:.1}", all.mean() * ns_per_tick),
+    );
+    row(
+        "two_clock_reads_back_to_back_median_ns",
+        format!("{:.1}", floor.quantile(0.5) as f64 * ns_per_tick),
+    );
+    row("ns_per_tick", format!("{ns_per_tick:.6}"));
+
+    let mut marks = String::from("time_of_day,messages_before,resting_orders,book_digest\n");
+    for c in &checked.checkpoints {
+        marks.push_str(&format!(
+            "{},{},{},{:016x}\n",
+            c.label, c.messages, c.resting_orders, c.digest
+        ));
+    }
+    marks.push_str(&format!(
+        "after_first_million_messages,1000000,{},{:016x}\n",
+        first_audit.resting_orders, first_audit.digest
+    ));
+
     let s = &checked.replay.stats;
     write(&out.join("messages_by_type.csv"), &report::messages_csv(s))?;
     let mut invariants = report::invariants_csv(s, &audit, checked.parse_errors);
     invariants.push_str(&format!("file_bytes,{file_bytes}\n"));
-    invariants.push_str(&format!(
-        "book_digest_after_first_million,{:016x}\n",
-        first_audit.digest
-    ));
     write(&out.join("invariants.csv"), &invariants)?;
+    write(&out.join("checkpoints.csv"), &marks)?;
     write(
         &out.join("crossed_symbols.csv"),
         &report::crossed_symbols_csv(&checked.replay, 50),
@@ -514,10 +729,13 @@ fn reproduce_full(data: &Path, out: &Path, runs: usize) -> Res<()> {
         &out.join("crossed_examples.csv"),
         &report::crossed_examples_csv(&checked.replay),
     )?;
-    write(&out.join("throughput.csv"), &timing)?;
+    write(&out.join("throughput.csv"), &throughput)?;
+    write(&out.join("throughput_runs.csv"), &each)?;
+    write(&out.join("profile.csv"), &profile)?;
+    write(&out.join("timer_overhead.csv"), &timer)?;
     write(
         &out.join("latency_percentiles.csv"),
-        &report::latency_csv(&latency_rows(&hists, ns_per_tick, &floor)),
+        &report::latency_csv(&rows),
     )?;
     let name = data
         .file_name()
@@ -525,16 +743,16 @@ fn reproduce_full(data: &Path, out: &Path, runs: usize) -> Res<()> {
         .unwrap_or_default();
     let title = "Time to parse and apply one ITCH message, by type";
     let subtitle = format!(
-        "{name}: {} messages, one core. Median replay of the day: {median_seconds:.1} s.",
-        s.messages
+        "{name}: {} messages, one pinned core. Median replay of the day: {:.1} s.",
+        s.messages, medians[3]
     );
     write(
         &out.join("latency.svg"),
         &report::latency_svg(&chart_rows(&hists, ns_per_tick), title, &subtitle),
     )?;
     println!(
-        "headline: {} messages, every book rebuilt in {median_seconds:.2} s (median of {runs})",
-        s.messages
+        "headline: {} messages, every book rebuilt in {:.2} s (median of {runs})",
+        s.messages, medians[3]
     );
     Ok(())
 }
@@ -547,8 +765,9 @@ fn cmd_reproduce(args: &[String]) -> Res<()> {
         return reproduce_fast(&out);
     }
     let data = value::<PathBuf>(args, "--data")?.unwrap_or_else(|| Path::new("data").join(DAY));
-    let runs = value::<usize>(args, "--runs")?.unwrap_or(3).max(1);
-    reproduce_full(&data, &out, runs)
+    let runs = value::<usize>(args, "--runs")?.unwrap_or(10).max(1);
+    let cpu = value::<usize>(args, "--cpu")?.unwrap_or(2);
+    reproduce_full(&data, &out, runs, cpu)
 }
 
 fn main() -> ExitCode {

@@ -210,6 +210,34 @@ impl Book {
         remaining
     }
 
+    /// Move a resting order to the front of the queue at its price.
+    pub fn move_to_front(&mut self, slot: u32) {
+        let (side, price, prev, next) = {
+            let o = &self.orders[slot as usize];
+            (o.side, o.price, o.prev, o.next)
+        };
+        if prev == NIL {
+            return;
+        }
+        let levels = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        let pos = find(levels, side, price).expect("a resting order has a level");
+        let level = &mut levels[pos];
+        self.orders[prev as usize].next = next;
+        if next == NIL {
+            level.tail = prev;
+        } else {
+            self.orders[next as usize].prev = prev;
+        }
+        let head = level.head;
+        level.head = slot;
+        self.orders[head as usize].prev = slot;
+        self.orders[slot as usize].prev = NIL;
+        self.orders[slot as usize].next = head;
+    }
+
     /// Give a resting order a new identifier without moving it in its queue.
     pub fn set_id(&mut self, slot: u32, id: u64) {
         self.orders[slot as usize].id = id;
