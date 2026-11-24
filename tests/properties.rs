@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use agora::book::{Book, BookError, Handle, Side};
 use agora::engine::{Engine, Fill};
-use agora::index::{HashIndex, OrderIndex, RefIndex, DIRECT_LIMIT};
+use agora::index::{HashIndex, OpenIndex, OrderIndex, PageIndex, DIRECT_LIMIT};
 use agora::itch::{message_len, parse, Body, FrameReader, Header, Message};
 use agora::replay::{Replay, Resting};
 use agora::synth::{generate, SynthConfig};
@@ -604,34 +604,41 @@ proptest! {
 
     #[test]
     fn ref_index_agrees_with_a_hash_map(ops in prop::collection::vec((0u8..3, index_key(), any::<u32>()), 0..400)) {
-        let mut index: RefIndex<u32> = RefIndex::new();
+        let mut index: PageIndex<u32> = PageIndex::new();
         let mut hashed: HashIndex<u32> = HashIndex::default();
+        let mut open: OpenIndex<u32> = OpenIndex::new();
         let mut model: HashMap<u64, u32> = HashMap::new();
         for (op, key, value) in ops {
             match op {
                 0 => {
                     let was = model.insert(key, value);
                     prop_assert_eq!(index.insert(key, value), was);
+                    prop_assert_eq!(open.insert(key, value), was);
                     prop_assert_eq!(OrderIndex::insert(&mut hashed, key, value), was);
                 }
                 1 => {
                     let was = model.remove(&key);
                     prop_assert_eq!(index.remove(key), was);
+                    prop_assert_eq!(open.remove(key), was);
                     prop_assert_eq!(OrderIndex::remove(&mut hashed, key), was);
                 }
                 _ => {
                     index.prefetch(key);
                     let is = model.get(&key).copied();
                     prop_assert_eq!(index.get(key), is);
+                    open.prefetch(key);
+                    prop_assert_eq!(open.get(key), is);
                     prop_assert_eq!(OrderIndex::get(&hashed, key), is);
                     prop_assert_eq!(OrderIndex::contains(&hashed, key), is.is_some());
                 }
             }
             prop_assert_eq!(index.len(), model.len());
+            prop_assert_eq!(open.len(), model.len());
             prop_assert_eq!(OrderIndex::len(&hashed), model.len());
         }
         for (key, value) in &model {
             prop_assert_eq!(index.get(*key), Some(*value));
+            prop_assert_eq!(open.get(*key), Some(*value));
         }
         for key in model.keys() {
             index.remove(*key);
@@ -723,13 +730,17 @@ proptest! {
                 hinted.apply(m);
             }
         }
-        // The first version's hash map index builds the same books too.
+        // The other two indexes build the same books too.
         let mut hashed: Replay<HashIndex<Resting>> = Replay::with_index(true);
+        let mut paged: Replay<PageIndex<Resting>> = Replay::with_index(true);
         for m in &parsed {
             hashed.apply(m);
+            paged.apply(m);
         }
         prop_assert_eq!(hashed.digest(), plain.digest());
         prop_assert_eq!(&hashed.stats, &plain.stats);
+        prop_assert_eq!(paged.digest(), plain.digest());
+        prop_assert_eq!(&paged.stats, &plain.stats);
         prop_assert_eq!(hinted.digest(), plain.digest());
         prop_assert_eq!(hinted.digest(), synth.digest);
         prop_assert_eq!(&hinted.stats, &plain.stats);

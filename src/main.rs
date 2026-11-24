@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use agora::hist::{ticks, Calibration, Histogram};
-use agora::index::{HashIndex, OrderIndex, RefIndex};
+use agora::index::{HashIndex, OpenIndex, OrderIndex, PageIndex};
 use agora::itch::{parse, Body, FrameReader, TYPES};
 use agora::pin::{busy_cpus, machine_cpu_times, pin_to_cpu};
 use agora::priority::{Priority, PriorityReport};
@@ -311,6 +311,24 @@ fn index_pass<I: OrderIndex<u64>>(path: &Path) -> Res<f64> {
     }
     std::hint::black_box(sink);
     Ok(start.elapsed().as_secs_f64())
+}
+
+/// Replay on index `I` and note how much memory the index holds at each
+/// checkpoint. Not timed.
+fn index_memory_pass<I: OrderIndex<Resting>>(path: &Path) -> Res<Vec<usize>> {
+    let mut frames = reader(path)?;
+    let mut replay: Replay<I> = Replay::with_index(false);
+    let mut sizes = Vec::new();
+    while let Some(frame) = frames.next_frame()? {
+        let Ok(m) = parse(frame) else { continue };
+        while sizes.len() < CHECKPOINTS.len()
+            && m.header.timestamp >= CHECKPOINTS[sizes.len()].1 * 1_000_000_000
+        {
+            sizes.push(replay.index().bytes());
+        }
+        replay.apply(&m);
+    }
+    Ok(sizes)
 }
 
 /// The timed replay, one message at a time, on either index. Returns the
@@ -720,18 +738,33 @@ fn reproduce_fast(out: &Path) -> Res<()> {
 }
 
 /// The passes timed in every round, in the order they run.
-const PASSES: [&str; 10] = [
+const PASSES: [&str; 12] = [
     "read_frames_only",
     "read_and_parse",
-    "lookup_only_hash_map",
+    "lookup_only_std_hash_map",
     "lookup_only_page_table",
-    "replay_hash_map",
+    "lookup_only",
+    "replay_std_hash_map",
+    "replay_page_table",
     "replay",
-    "replay_batched_hash_map",
+    "replay_batched_std_hash_map",
     "replay_batched",
     "replay_with_checks",
     "replay_with_per_message_timing",
 ];
+// Positions in `PASSES`.
+const FRAMES: usize = 0;
+const PARSE: usize = 1;
+const LOOKUP_STD: usize = 2;
+const LOOKUP_PAGE: usize = 3;
+const LOOKUP: usize = 4;
+const REPLAY_STD: usize = 5;
+const REPLAY_PAGE: usize = 6;
+const REPLAY: usize = 7;
+const BATCHED_STD: usize = 8;
+const BATCHED: usize = 9;
+const CHECKED: usize = 10;
+const TIMED: usize = 11;
 
 /// The numbers every replay of one file must agree on.
 fn ledger(s: &Stats) -> [u64; 8] {
@@ -773,16 +806,20 @@ fn bench(data: &Path, runs: usize, cpu: usize, expected: Option<[u64; 8]>) -> Re
     // then one full replay.
     println!("warm-up ...");
     parse_pass(data)?;
-    let (_, warm) = timed_replay::<RefIndex<Resting>>(data, false)?;
+    let (_, warm) = timed_replay::<OpenIndex<Resting>>(data, false)?;
     let expected = expected.unwrap_or(warm);
     if warm != expected {
         return Err("the warm-up replay disagrees with the checked pass".into());
     }
-    let agree = |name: &str, got: [u64; 8]| -> Res<()> {
+    let agree = |pass: usize, got: [u64; 8]| -> Res<()> {
         if got == expected {
             Ok(())
         } else {
-            Err(format!("{name} counted differently from the other replays").into())
+            Err(format!(
+                "{} counted differently from the other replays",
+                PASSES[pass]
+            )
+            .into())
         }
     };
 
@@ -791,33 +828,38 @@ fn bench(data: &Path, runs: usize, cpu: usize, expected: Option<[u64; 8]>) -> Re
     let mut latency = None;
     for round in 1..=runs {
         println!("round {round} of {runs} ...");
-        times[0].push(frames_pass(data)?.1);
-        times[1].push(parse_pass(data)?.1);
-        times[2].push(index_pass::<HashIndex<u64>>(data)?);
-        times[3].push(index_pass::<RefIndex<u64>>(data)?);
+        times[FRAMES].push(frames_pass(data)?.1);
+        times[PARSE].push(parse_pass(data)?.1);
+        times[LOOKUP_STD].push(index_pass::<HashIndex<u64>>(data)?);
+        times[LOOKUP_PAGE].push(index_pass::<PageIndex<u64>>(data)?);
+        times[LOOKUP].push(index_pass::<OpenIndex<u64>>(data)?);
         let (secs, got) = timed_replay::<HashIndex<Resting>>(data, false)?;
-        agree(PASSES[4], got)?;
-        times[4].push(secs);
-        let (secs, got) = timed_replay::<RefIndex<Resting>>(data, false)?;
-        agree(PASSES[5], got)?;
-        times[5].push(secs);
+        agree(REPLAY_STD, got)?;
+        times[REPLAY_STD].push(secs);
+        let (secs, got) = timed_replay::<PageIndex<Resting>>(data, false)?;
+        agree(REPLAY_PAGE, got)?;
+        times[REPLAY_PAGE].push(secs);
+        let (secs, got) = timed_replay::<OpenIndex<Resting>>(data, false)?;
+        agree(REPLAY, got)?;
+        times[REPLAY].push(secs);
         let (secs, got) = timed_replay_batched::<HashIndex<Resting>>(data)?;
-        agree(PASSES[6], got)?;
-        times[6].push(secs);
-        let (secs, got) = timed_replay_batched::<RefIndex<Resting>>(data)?;
-        agree(PASSES[7], got)?;
-        times[7].push(secs);
-        let (secs, got) = timed_replay::<RefIndex<Resting>>(data, true)?;
-        agree(PASSES[8], got)?;
-        times[8].push(secs);
+        agree(BATCHED_STD, got)?;
+        times[BATCHED_STD].push(secs);
+        let (secs, got) = timed_replay_batched::<OpenIndex<Resting>>(data)?;
+        agree(BATCHED, got)?;
+        times[BATCHED].push(secs);
+        let (secs, got) = timed_replay::<OpenIndex<Resting>>(data, true)?;
+        agree(CHECKED, got)?;
+        times[CHECKED].push(secs);
         let (hists, ns_per_tick, floor, seconds) = latency_pass(data)?;
-        times[9].push(seconds);
+        times[TIMED].push(seconds);
         latency = Some((hists, ns_per_tick, floor));
         println!(
-            "  first version {:.3} s, page table {:.3} s, batched {:.3} s",
-            times[4][round - 1],
-            times[5][round - 1],
-            times[7][round - 1]
+            "  first version {:.3} s, page table {:.3} s, now {:.3} s, batched {:.3} s",
+            times[REPLAY_STD][round - 1],
+            times[REPLAY_PAGE][round - 1],
+            times[REPLAY][round - 1],
+            times[BATCHED][round - 1]
         );
     }
     let (hists, ns_per_tick, floor) = latency.ok_or("no rounds were run")?;
@@ -865,52 +907,66 @@ fn write_bench(out: &Path, b: &Bench, name: &str) -> Res<()> {
     }
 
     // Where the time goes, one message at a time, from the differences
-    // between passes: with the first version's hash map and with the page
-    // table.
-    let mut profile = String::from("stage,hash_map_ns_per_message,page_table_ns_per_message\n");
+    // between passes, for each of the three order indexes.
+    let mut profile = String::from(
+        "stage,std_hash_map_ns_per_message,page_table_ns_per_message,open_table_ns_per_message\n",
+    );
+    let read = medians[FRAMES];
+    let parse = medians[PARSE] - medians[FRAMES];
     let stages = [
-        (
-            "read the file and split it into messages",
-            medians[0],
-            medians[0],
-        ),
-        ("parse", medians[1] - medians[0], medians[1] - medians[0]),
+        ("read the file and split it into messages", [read; 3]),
+        ("parse", [parse; 3]),
         (
             "order reference lookup",
-            medians[2] - medians[1],
-            medians[3] - medians[1],
+            [
+                medians[LOOKUP_STD] - medians[PARSE],
+                medians[LOOKUP_PAGE] - medians[PARSE],
+                medians[LOOKUP] - medians[PARSE],
+            ],
         ),
         (
             "book update and counters",
-            medians[4] - medians[2],
-            medians[5] - medians[3],
+            [
+                medians[REPLAY_STD] - medians[LOOKUP_STD],
+                medians[REPLAY_PAGE] - medians[LOOKUP_PAGE],
+                medians[REPLAY] - medians[LOOKUP],
+            ],
         ),
-        ("whole replay", medians[4], medians[5]),
+        (
+            "whole replay",
+            [medians[REPLAY_STD], medians[REPLAY_PAGE], medians[REPLAY]],
+        ),
     ];
-    for (stage, hash, page) in stages {
+    for (stage, secs) in stages {
         profile.push_str(&format!(
-            "{stage},{:.1},{:.1}\n",
-            per_message(hash),
-            per_message(page)
+            "{stage},{:.1},{:.1},{:.1}\n",
+            per_message(secs[0]),
+            per_message(secs[1]),
+            per_message(secs[2])
         ));
     }
 
-    // The four combinations of index and batching, from the same rounds.
+    // The versions tried, from the same rounds.
     let mut versions = String::from(
         "order_index,messages_applied,min_seconds,median_seconds,max_seconds,median_ns_per_message,median_million_messages_per_second,speedup_over_first_version\n",
     );
     for (index, how, slot) in [
-        ("hash map (first version)", "one at a time", 4),
-        ("page table", "one at a time", 5),
-        ("hash map (first version)", "32 at a time with prefetch", 6),
-        ("page table", "32 at a time with prefetch", 7),
+        ("std hash map (first version)", "one at a time", REPLAY_STD),
+        ("page table (tried)", "one at a time", REPLAY_PAGE),
+        ("open table", "one at a time", REPLAY),
+        (
+            "std hash map (first version)",
+            "32 at a time with prefetch",
+            BATCHED_STD,
+        ),
+        ("open table", "32 at a time with prefetch", BATCHED),
     ] {
         let (lo, mid, hi) = spread(&b.times[slot]);
         versions.push_str(&format!(
             "{index},{how},{lo:.3},{mid:.3},{hi:.3},{:.1},{:.3},{:.2}\n",
             per_message(mid),
             n as f64 / mid / 1e6,
-            medians[4] / mid
+            medians[REPLAY_STD] / mid
         ));
     }
 
@@ -937,15 +993,15 @@ fn write_bench(out: &Path, b: &Bench, name: &str) -> Res<()> {
     );
     row(
         "replay_median_ns_per_message",
-        format!("{:.1}", per_message(medians[5])),
+        format!("{:.1}", per_message(medians[REPLAY])),
     );
     row(
         "replay_with_per_message_timing_median_ns_per_message",
-        format!("{:.1}", per_message(medians[9])),
+        format!("{:.1}", per_message(medians[TIMED])),
     );
     row(
         "timing_cost_ns_per_message",
-        format!("{:.1}", per_message(medians[9] - medians[5])),
+        format!("{:.1}", per_message(medians[TIMED] - medians[REPLAY])),
     );
     row(
         "mean_measured_latency_ns",
@@ -970,7 +1026,7 @@ fn write_bench(out: &Path, b: &Bench, name: &str) -> Res<()> {
     let title = "Time to parse and apply one ITCH message, by type";
     let subtitle = format!(
         "{name}: {n} messages, one pinned core, one message at a time. Median replay of the day: {:.1} s.",
-        medians[5]
+        medians[REPLAY]
     );
     write(
         &out.join("latency.svg"),
@@ -978,7 +1034,7 @@ fn write_bench(out: &Path, b: &Bench, name: &str) -> Res<()> {
     )?;
     println!(
         "headline: {n} messages, every book rebuilt in {:.2} s one at a time, {:.2} s batched (medians of {})",
-        medians[5], medians[7], b.runs
+        medians[REPLAY], medians[BATCHED], b.runs
     );
     Ok(())
 }
@@ -1037,6 +1093,27 @@ fn reproduce_full(data: &Path, out: &Path, runs: usize, cpu: usize) -> Res<()> {
         return Err("two replays count differently".into());
     }
 
+    println!("index memory passes ...");
+    let memory = [
+        index_memory_pass::<HashIndex<Resting>>(data)?,
+        index_memory_pass::<PageIndex<Resting>>(data)?,
+        index_memory_pass::<OpenIndex<Resting>>(data)?,
+    ];
+    let mut memory_csv = String::from(
+        "time_of_day,resting_orders,std_hash_map_megabytes_estimate,page_table_megabytes,open_table_megabytes\n",
+    );
+    for (i, c) in checked.checkpoints.iter().enumerate() {
+        let mb = |k: usize| memory[k].get(i).map_or(0.0, |b| *b as f64 / 1e6);
+        memory_csv.push_str(&format!(
+            "{},{},{:.1},{:.1},{:.1}\n",
+            c.label,
+            c.resting_orders,
+            mb(0),
+            mb(1),
+            mb(2)
+        ));
+    }
+
     println!("queue-priority passes ...");
     let priority = priority_pass(data, ReplacePolicy::BackOfQueue)?;
     let other_reading = priority_pass(data, ReplacePolicy::KeepIfSamePriceAndNotLarger)?;
@@ -1066,6 +1143,7 @@ fn reproduce_full(data: &Path, out: &Path, runs: usize, cpu: usize) -> Res<()> {
     invariants.push_str(&format!("file_bytes,{file_bytes}\n"));
     write(&out.join("invariants.csv"), &invariants)?;
     write(&out.join("checkpoints.csv"), &marks)?;
+    write(&out.join("index_memory.csv"), &memory_csv)?;
     let mut priority_csv = priority.to_csv();
     priority_csv.push_str(&format!(
         "other_replace_reading_out_of_turn,{}\n",

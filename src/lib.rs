@@ -3,7 +3,7 @@
 //!
 //! - [`book`]: one instrument's book, with first-in-first-out queues per price.
 //! - [`engine`]: a matching engine on top of the book.
-//! - [`index`]: the order reference index, a page table keyed by reference.
+//! - [`index`]: the order reference index: an open-addressing hash table, and two others the benchmark compares it with.
 //! - [`itch`]: the ITCH 5.0 message formats and a reader for framed files.
 //! - [`replay`]: rebuilds every book from a message stream and checks it.
 //! - [`synth`]: a seeded generator of valid ITCH streams for tests.

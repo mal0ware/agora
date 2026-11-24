@@ -1,17 +1,20 @@
 //! The order reference index: from an order reference number to wherever the
 //! caller keeps that order.
 //!
-//! Nasdaq hands out order reference numbers in rising order through the day,
-//! and most orders die young, so at any moment the live references sit in a
-//! few dense ranges. The index uses that. A reference is split into a page
-//! number and an offset; a page is a flat array of 4,096 entries, allocated
-//! when its first reference arrives and released when its last one leaves. A
-//! lookup is two array reads with no hashing, and new orders land next to
-//! each other in memory.
+//! Three types do the job, behind [`OrderIndex`].
 //!
-//! Nothing about correctness depends on the references being dense or
-//! rising. References at or above [`DIRECT_LIMIT`] go to an ordinary hash
-//! map, so any `u64` works; sparse references only cost memory.
+//! - [`OpenIndex`] is the one every published number uses: an open-addressing
+//!   hash table with linear probing. Its entries sit in one flat array, so the
+//!   slot a key will land in is known from the key alone and can be
+//!   prefetched before the lookup.
+//! - [`HashIndex`] is the standard library's hash map, which the first
+//!   version used. The benchmark still times it.
+//! - [`PageIndex`] is a page table indexed directly by the reference number.
+//!   It was tried because Nasdaq hands out reference numbers in rising order,
+//!   and it lost: long-lived orders are scattered through the number range
+//!   and each one pins a 64 KiB page, so on the sample day the table grows to
+//!   several gigabytes to hold under two million orders. It is kept so the
+//!   benchmark can show that.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -53,10 +56,7 @@ impl Hasher for RefHasher {
 /// A hash map keyed by order reference number.
 pub type RefMap<V> = HashMap<u64, V, BuildHasherDefault<RefHasher>>;
 
-/// What a replay needs from an order reference index. Two types provide
-/// it: [`RefIndex`], the page table every published number uses, and
-/// [`HashIndex`], the hash map the first version used, kept so the benchmark
-/// can time one against the other in the same run.
+/// What a replay needs from an order reference index.
 pub trait OrderIndex<V: Copy>: Default {
     /// The value stored for `key`.
     fn get(&self, key: u64) -> Option<V>;
@@ -78,9 +78,12 @@ pub trait OrderIndex<V: Copy>: Default {
     /// Hint that `key` is about to be looked up. Changes nothing.
     #[inline]
     fn prefetch(&self, _key: u64) {}
+    /// Bytes of memory the index holds right now, to the nearest entry.
+    fn bytes(&self) -> usize;
 }
 
-/// The first version's index: a hash map with a one-multiply hasher. It
+/// The first version's index: the standard hash map with a one-multiply
+/// hasher. It
 /// cannot say where a key will land before hashing it into the table, so its
 /// prefetch hint does nothing.
 pub struct HashIndex<V>(RefMap<V>);
@@ -111,32 +114,258 @@ impl<V: Copy> OrderIndex<V> for HashIndex<V> {
     fn len(&self) -> usize {
         self.0.len()
     }
+
+    /// An estimate: the map's capacity times one key, one value and one
+    /// control byte. The standard library does not report its real size.
+    fn bytes(&self) -> usize {
+        self.0.capacity() * (std::mem::size_of::<(u64, V)>() + 1)
+    }
 }
 
-impl<V: Copy> OrderIndex<V> for RefIndex<V> {
+impl<V: Copy> OrderIndex<V> for PageIndex<V> {
     #[inline]
     fn get(&self, key: u64) -> Option<V> {
-        RefIndex::get(self, key)
+        PageIndex::get(self, key)
     }
 
     #[inline]
     fn insert(&mut self, key: u64, value: V) -> Option<V> {
-        RefIndex::insert(self, key, value)
+        PageIndex::insert(self, key, value)
     }
 
     #[inline]
     fn remove(&mut self, key: u64) -> Option<V> {
-        RefIndex::remove(self, key)
+        PageIndex::remove(self, key)
     }
 
     #[inline]
     fn len(&self) -> usize {
-        RefIndex::len(self)
+        PageIndex::len(self)
     }
 
     #[inline]
     fn prefetch(&self, key: u64) {
-        RefIndex::prefetch(self, key)
+        PageIndex::prefetch(self, key)
+    }
+
+    fn bytes(&self) -> usize {
+        self.pages_in_use() * std::mem::size_of::<Page<V>>()
+            + self.pages.len() * std::mem::size_of::<Option<Box<Page<V>>>>()
+            + self.spill.capacity() * (std::mem::size_of::<(u64, V)>() + 1)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Slot<V> {
+    key: u64,
+    /// `None` marks an empty slot.
+    value: Option<V>,
+}
+
+/// An open-addressing hash table from order reference number to a small
+/// copyable value: one flat array, linear probing, and deletion by shifting
+/// later entries back so that no tombstones are left behind.
+///
+/// The table doubles when it is half full and never shrinks.
+pub struct OpenIndex<V> {
+    slots: Vec<Slot<V>>,
+    /// `64 - log2(slots.len())`: how far to shift a hash to get a slot.
+    shift: u32,
+    len: usize,
+}
+
+impl<V: Copy> Default for OpenIndex<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V: Copy> OpenIndex<V> {
+    const MIN_BITS: u32 = 4;
+
+    /// An empty index.
+    pub fn new() -> Self {
+        OpenIndex {
+            slots: vec![
+                Slot {
+                    key: 0,
+                    value: None
+                };
+                1 << Self::MIN_BITS
+            ],
+            shift: 64 - Self::MIN_BITS,
+            len: 0,
+        }
+    }
+
+    /// The slot a key is looked for first.
+    #[inline]
+    fn home(&self, key: u64) -> usize {
+        (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift) as usize
+    }
+
+    /// Number of references held.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True when no reference is held.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Slots allocated, for tests and memory accounting.
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Hint that `key` is about to be looked up. Changes nothing.
+    #[inline]
+    pub fn prefetch(&self, key: u64) {
+        crate::mem::prefetch(&self.slots[self.home(key)]);
+    }
+
+    /// The value stored for `key`.
+    #[inline]
+    pub fn get(&self, key: u64) -> Option<V> {
+        let mask = self.slots.len() - 1;
+        let mut i = self.home(key);
+        loop {
+            let slot = &self.slots[i];
+            match slot.value {
+                None => return None,
+                Some(v) if slot.key == key => return Some(v),
+                Some(_) => i = (i + 1) & mask,
+            }
+        }
+    }
+
+    /// True when `key` is held.
+    #[inline]
+    pub fn contains(&self, key: u64) -> bool {
+        self.get(key).is_some()
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let bits = 64 - self.shift + 1;
+        let old = std::mem::replace(
+            &mut self.slots,
+            vec![
+                Slot {
+                    key: 0,
+                    value: None
+                };
+                1usize << bits
+            ],
+        );
+        self.shift = 64 - bits;
+        let mask = self.slots.len() - 1;
+        for slot in old {
+            if slot.value.is_some() {
+                let mut i = self.home(slot.key);
+                while self.slots[i].value.is_some() {
+                    i = (i + 1) & mask;
+                }
+                self.slots[i] = slot;
+            }
+        }
+    }
+
+    /// Store `value` for `key`. Returns the value it replaced, if any.
+    #[inline]
+    pub fn insert(&mut self, key: u64, value: V) -> Option<V> {
+        if (self.len + 1) * 2 > self.slots.len() {
+            self.grow();
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = self.home(key);
+        loop {
+            let slot = &mut self.slots[i];
+            match slot.value {
+                None => {
+                    *slot = Slot {
+                        key,
+                        value: Some(value),
+                    };
+                    self.len += 1;
+                    return None;
+                }
+                Some(old) if slot.key == key => {
+                    slot.value = Some(value);
+                    return Some(old);
+                }
+                Some(_) => i = (i + 1) & mask,
+            }
+        }
+    }
+
+    /// Forget `key`. Returns the value it had, if any.
+    #[inline]
+    pub fn remove(&mut self, key: u64) -> Option<V> {
+        let mask = self.slots.len() - 1;
+        let mut i = self.home(key);
+        let old = loop {
+            let slot = &self.slots[i];
+            match slot.value {
+                None => return None,
+                Some(v) if slot.key == key => break v,
+                Some(_) => i = (i + 1) & mask,
+            }
+        };
+        // Close the gap: walk the run of entries after the hole and move
+        // back each one that the hole stands between it and its home slot.
+        let mut hole = i;
+        let mut j = i;
+        loop {
+            j = (j + 1) & mask;
+            let slot = self.slots[j];
+            if slot.value.is_none() {
+                break;
+            }
+            let from_home = j.wrapping_sub(self.home(slot.key)) & mask;
+            let from_hole = j.wrapping_sub(hole) & mask;
+            if from_home >= from_hole {
+                self.slots[hole] = slot;
+                hole = j;
+            }
+        }
+        self.slots[hole].value = None;
+        self.len -= 1;
+        Some(old)
+    }
+}
+
+impl<V: Copy> OrderIndex<V> for OpenIndex<V> {
+    #[inline]
+    fn get(&self, key: u64) -> Option<V> {
+        OpenIndex::get(self, key)
+    }
+
+    #[inline]
+    fn insert(&mut self, key: u64, value: V) -> Option<V> {
+        OpenIndex::insert(self, key, value)
+    }
+
+    #[inline]
+    fn remove(&mut self, key: u64) -> Option<V> {
+        OpenIndex::remove(self, key)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        OpenIndex::len(self)
+    }
+
+    #[inline]
+    fn prefetch(&self, key: u64) {
+        OpenIndex::prefetch(self, key)
+    }
+
+    fn bytes(&self) -> usize {
+        self.slots.len() * std::mem::size_of::<Slot<V>>()
     }
 }
 
@@ -154,24 +383,29 @@ impl<V: Copy> Page<V> {
     }
 }
 
-/// A map from order reference number to a small copyable value.
-pub struct RefIndex<V> {
+/// A page table from order reference number to a small copyable value.
+///
+/// A reference is split into a page number and an offset; a page is a flat
+/// array of 4,096 entries, allocated when its first reference arrives and
+/// released when its last one leaves. References at or above
+/// [`DIRECT_LIMIT`] go to a hash map, so any `u64` works.
+pub struct PageIndex<V> {
     pages: Vec<Option<Box<Page<V>>>>,
     spare: Vec<Box<Page<V>>>,
     spill: RefMap<V>,
     len: usize,
 }
 
-impl<V: Copy> Default for RefIndex<V> {
+impl<V: Copy> Default for PageIndex<V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<V: Copy> RefIndex<V> {
+impl<V: Copy> PageIndex<V> {
     /// An empty index.
     pub fn new() -> Self {
-        RefIndex {
+        PageIndex {
             pages: Vec::new(),
             spare: Vec::new(),
             spill: RefMap::default(),
@@ -282,7 +516,7 @@ mod tests {
 
     #[test]
     fn insert_get_remove_on_both_paths() {
-        let mut ix = RefIndex::new();
+        let mut ix = PageIndex::new();
         let keys = [
             0u64,
             1,
@@ -313,12 +547,44 @@ mod tests {
     }
 
     #[test]
+    fn open_index_inserts_grows_and_closes_gaps() {
+        let mut ix = OpenIndex::new();
+        // Enough keys to grow several times, in an order that collides.
+        for k in 0..5_000u64 {
+            assert_eq!(ix.insert(k * 7, k), None);
+        }
+        assert_eq!(ix.len(), 5_000);
+        assert!(ix.capacity() >= 10_000);
+        assert_eq!(
+            OrderIndex::bytes(&ix),
+            ix.capacity() * std::mem::size_of::<Slot<u64>>()
+        );
+        assert_eq!(ix.insert(14, 99), Some(2));
+        // Remove every other key; the rest must still be found.
+        for k in (0..5_000u64).step_by(2) {
+            assert!(ix.remove(k * 7).is_some());
+            assert_eq!(ix.remove(k * 7), None);
+        }
+        for k in 0..5_000u64 {
+            let want = if k % 2 == 1 { Some(k) } else { None };
+            assert_eq!(ix.get(k * 7), want, "key {}", k * 7);
+        }
+        ix.prefetch(u64::MAX);
+        assert_eq!(ix.insert(u64::MAX, 1), None);
+        assert_eq!(ix.insert(0, 2), None);
+        assert_eq!(ix.remove(u64::MAX), Some(1));
+        assert_eq!(ix.get(0), Some(2));
+        assert_eq!(ix.len(), 2_501);
+    }
+
+    #[test]
     fn empty_pages_are_released_and_reused() {
-        let mut ix = RefIndex::new();
+        let mut ix = PageIndex::new();
         for k in 0..10_000u64 {
             ix.insert(k, k);
         }
         assert_eq!(ix.pages_in_use(), 3);
+        assert!(OrderIndex::bytes(&ix) >= 3 * 4096 * 16);
         for k in 0..8_192u64 {
             assert_eq!(ix.remove(k), Some(k));
         }
@@ -332,7 +598,7 @@ mod tests {
 
     #[test]
     fn lookups_far_past_the_directory_are_misses() {
-        let mut ix: RefIndex<u8> = RefIndex::new();
+        let mut ix: PageIndex<u8> = PageIndex::new();
         ix.insert(5, 1);
         assert_eq!(ix.get(DIRECT_LIMIT - 1), None);
         assert_eq!(ix.remove(DIRECT_LIMIT - 1), None);

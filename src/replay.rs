@@ -9,7 +9,7 @@
 //! best price, and at the end audits every book and balances the share ledger.
 
 use crate::book::{digest_books, Book, Handle, Side};
-use crate::index::{OrderIndex, RefIndex};
+use crate::index::{OpenIndex, OrderIndex};
 use crate::itch::{Body, Message, Stock};
 
 /// 09:30:00 in nanoseconds since midnight.
@@ -254,9 +254,9 @@ fn session(ts: u64) -> usize {
 
 /// Replays ITCH messages into one book per stock locate.
 ///
-/// `I` is the order reference index. Leave it alone to get the page table;
+/// `I` is the order reference index. Leave it alone to get [`OpenIndex`];
 /// [`Replay::with_index`] picks another, which only the benchmark does.
-pub struct Replay<I = RefIndex<Resting>> {
+pub struct Replay<I = OpenIndex<Resting>> {
     policy: ReplacePolicy,
     books: Vec<Book>,
     symbols: Vec<Stock>,
@@ -292,6 +292,11 @@ impl<I: OrderIndex<Resting>> Replay<I> {
             stats: Stats::default(),
             examples: Vec::new(),
         }
+    }
+
+    /// The order reference index, read-only.
+    pub fn index(&self) -> &I {
+        &self.refs
     }
 
     /// Use a different rule for where replaced orders go.
