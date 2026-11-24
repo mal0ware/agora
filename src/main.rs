@@ -1102,13 +1102,17 @@ fn reproduce_full(data: &Path, out: &Path, runs: usize, cpu: usize) -> Res<()> {
     let mut memory_csv = String::from(
         "time_of_day,resting_orders,std_hash_map_megabytes_estimate,page_table_megabytes,open_table_megabytes\n",
     );
+    // The standard map reports less capacity as deleted slots pile up, though
+    // it never gives memory back, so its column is the largest figure so far.
+    let mut std_peak = 0.0f64;
     for (i, c) in checked.checkpoints.iter().enumerate() {
         let mb = |k: usize| memory[k].get(i).map_or(0.0, |b| *b as f64 / 1e6);
+        std_peak = std_peak.max(mb(0));
         memory_csv.push_str(&format!(
             "{},{},{:.1},{:.1},{:.1}\n",
             c.label,
             c.resting_orders,
-            mb(0),
+            std_peak,
             mb(1),
             mb(2)
         ));

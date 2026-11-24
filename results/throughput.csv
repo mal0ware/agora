@@ -1,0 +1,13 @@
+pass,runs,min_seconds,median_seconds,max_seconds,spread_percent,median_ns_per_message,median_million_messages_per_second
+read_frames_only,10,1.784,1.874,2.836,56.2,7.0,143.442
+read_and_parse,10,4.644,4.824,6.622,41.0,17.9,55.713
+lookup_only_std_hash_map,10,15.975,18.441,33.821,96.8,68.6,14.573
+lookup_only_page_table,10,12.525,15.765,25.347,81.3,58.7,17.047
+lookup_only,10,20.975,22.010,31.200,46.5,81.9,12.210
+replay_std_hash_map,10,47.194,56.707,97.919,89.5,211.0,4.739
+replay_page_table,10,55.828,73.202,163.946,147.7,272.4,3.671
+replay,10,50.610,58.501,88.195,64.2,217.7,4.594
+replay_batched_std_hash_map,10,33.054,37.777,56.583,62.3,140.6,7.114
+replay_batched,10,31.707,34.229,51.167,56.9,127.4,7.851
+replay_with_checks,10,53.112,61.929,87.872,56.1,230.4,4.340
+replay_with_per_message_timing,10,58.649,67.513,98.076,58.4,251.2,3.981

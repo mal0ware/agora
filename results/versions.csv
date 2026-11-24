@@ -1,0 +1,6 @@
+order_index,messages_applied,min_seconds,median_seconds,max_seconds,median_ns_per_message,median_million_messages_per_second,speedup_over_first_version
+std hash map (first version),one at a time,47.194,56.707,97.919,211.0,4.739,1.00
+page table (tried),one at a time,55.828,73.202,163.946,272.4,3.671,0.77
+open table,one at a time,50.610,58.501,88.195,217.7,4.594,0.97
+std hash map (first version),32 at a time with prefetch,33.054,37.777,56.583,140.6,7.114,1.50
+open table,32 at a time with prefetch,31.707,34.229,51.167,127.4,7.851,1.66

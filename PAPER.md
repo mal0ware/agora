@@ -7,7 +7,10 @@ Nasdaq, *Nasdaq TotalView-ITCH 5.0* (the specification PDF, 36 pages, last revis
 
 Section numbers below are the ones printed in that PDF. Its revision log still refers to some sections by older numbers (for example "4.2.8" for the Operational Halt message, which the body numbers 1.2.8); this file uses the body numbers.
 
-The PDF was read in full before the parser was written. Every layout below was copied from its tables and is implemented in `src/itch.rs`. `tests/messages.rs` builds one message of every type by hand at these offsets and parses it.
+Every layout below was copied from its tables and is implemented in `src/itch.rs`. `tests/messages.rs` builds one message of every type by hand at these offsets and parses it.
+
+One other document is used, only in the section on queue priority: Nasdaq, *Opening and Closing Crosses: Frequently Asked Questions*, fetched on 2026-11-24 from
+`https://www.nasdaqtrader.com/content/productsservices/Trading/Crosses/openclose_faqs.pdf`.
 
 ## Data types (section "Data Types", page 4)
 
@@ -97,7 +100,7 @@ The file is older than three changes in the specification's revision log: the Ex
 
 ## Claim by claim
 
-Every number is from `results/`, written by `agora reproduce` in this build.
+Every number is from `results/`, written by `agora reproduce`.
 
 | What the specification says | What the day shows |
 |---|---|
@@ -112,7 +115,7 @@ Every number is from `results/`, written by `agora reproduce` in this build.
 
 Counts by type are in `results/messages_by_type.csv`. Add Order (`A`) is 43.6% of the day, Order Delete (`D`) 42.6%, Order Replace (`U`) 8.1%.
 
-## The two invariants
+## Invariants
 
 ### Volume is conserved
 
@@ -128,9 +131,28 @@ Every share added leaves by one of four routes or is still resting at the end.
 | Resting at the end of the day | 0 |
 | Added minus all of the above | 0 |
 
-The resting total is read from the books at the end, after an audit that walks every queue and compares it with its level's aggregate, so the balance is a check on the book structure and not only on the arithmetic. Every book is empty at the end of the day: each order that was added was later executed, deleted or replaced. The largest number of orders resting at once was 1,924,078.
+The resting total is read from the books at the end, after an audit that walks every queue and compares it with its level's aggregate, so the balance also checks the book structure. Every book is empty at the end of the day: each order that was added was later executed, deleted or replaced. The largest number of orders resting at once was 1,924,078.
 
 Only 1.5% of the shares added were executed.
+
+### Book fingerprints through the day
+
+Every book is empty at the end, so a digest of the final books is the digest of nothing. The run takes a digest of every book just before the first message at or after each of eight times instead. The digest covers each level's price, total and order count and each order's reference and remaining shares, in queue order.
+
+| Time of day | Messages before | Orders resting | Digest of all books |
+|---|---:|---:|---|
+| 07:00:00 | 2,524,145 | 7,574 | `4af5c11b1686ce4c` |
+| 09:30:00 | 6,696,719 | 414,434 | `db2caccc980653e3` |
+| 09:35:00 | 12,832,456 | 1,653,863 | `93d646146a2b0e8d` |
+| 11:00:00 | 94,229,269 | 1,756,394 | `aebbad60de993a00` |
+| 13:00:00 | 164,067,379 | 1,789,421 | `835aeb97a4a0c8e1` |
+| 15:00:00 | 219,952,342 | 1,789,757 | `baaa72f5aad3b65b` |
+| 16:00:00 | 265,920,781 | 1,758,807 | `b163ab709d83e008` |
+| 18:00:00 | 268,397,172 | 147,778 | `ed4d97569cef74d6` |
+
+The checked replay, the unchecked replay and the batched replay are each run to these points and must give the same eight digests, or the run stops. The table is `results/checkpoints.csv`. It also holds the digest after the first million messages, `8b546eda1fe37dee`, which `tests/golden.rs` pins.
+
+The first version of the code (commit `5b7fc48`, before the order index, the handles and the batching were changed) gives the same nine digests. Its table is kept as `results/first_version/checkpoints.csv`; `git checkout 5b7fc48` and `cargo run --release -- reproduce --runs 1` rebuilds it.
 
 ### The book is never crossed, with exceptions
 
@@ -141,7 +163,7 @@ After each of the 284,881,004 book updates the checker compares that stock's bes
 - 70 updates left a book locked (best bid equal to best ask). The checker does not record the trading state for these.
 - No book was crossed at the end of the day.
 
-So the claim that holds on this day is narrower than the design's: the rebuilt book is never crossed while the stock is trading. During a halt or pause Nasdaq keeps accepting orders without matching them, and the displayed book crosses until the reopening cross. The specification does not state this. It is what the data shows, and it agrees with how section 1.2.2 describes halts and section 1.6 describes the halt cross. `results/crossed_examples.csv` lists all 30 episodes and `results/crossed_symbols.csv` the 13 stocks. PNRL was crossed longest: 43,149 seconds, from 08:00:50 until about 20:00.
+So the claim that holds on this day is that the rebuilt book is never crossed while the stock is trading. During a halt or pause Nasdaq keeps accepting orders without matching them, and the displayed book crosses until the reopening cross. The specification does not state this. It is what the data shows, and it agrees with how section 1.2.2 describes halts and section 1.6 describes the halt cross. `results/crossed_examples.csv` lists all 30 episodes and `results/crossed_symbols.csv` the 13 stocks. PNRL was crossed longest: 43,149 seconds, from 08:00:50 until about 20:00.
 
 ## Price-time priority
 
@@ -153,54 +175,213 @@ The feed does not say why an order was executed, but the rebuilt book can say wh
 | At the best price | 5,722,824 | 99,644 |
 | Oldest order at the best price | 5,712,259 | 17,268 |
 
-Every `E` execution was at the best price, and 99.815% took the oldest order there. The other 10,565 took an order at the best price that had an older order ahead of it in the rebuilt queue. All 10,565 happened between 09:30 and 16:00 with the stock in state `T`. I could not determine the cause. Two candidates, neither tested: order types whose priority is not the order of their add messages, and a queue rule for Order Replace that differs from both readings tried below.
+Every `E` execution was at the best price, and 99.815% took the oldest order there. The other 10,565 took an order that had an older order ahead of it in the rebuilt queue. Call these out of turn.
 
 Section 1.4.2 says `C` is sent when the execution price differs from the display price, and that non-printable ones belong to a later bulk print such as a cross. Only 17% of them took the oldest order at the best price, so queue order is not what decides them. 3,754,970 of their shares are marked non-printable.
+
+### What the out-of-turn executions have in common
+
+`agora priority <file>` looks at each of the 10,565 and writes `results/priority.csv` and `results/priority_by_time.csv`. It first tests the explanations that need nothing but the feed.
+
+| Explanation | What it predicts | What the day shows |
+|---|---|---|
+| A minimum-quantity incoming order skipped resting orders that were too small for it | Every skipped order is smaller than the shares executed | True for 3,600 of 10,565 (34%). In the other 6,965 at least one skipped order was big enough |
+| Odd lots rank behind round lots | Every skipped order is under 100 shares | True for 4,856 (46%) |
+| The queue place of replaced orders is wrong | The executed order, or a skipped one, came from an Order Replace | 0 executed orders and 1 of 88,133 skipped orders came from a replace. None came from a replace that kept its price without growing, which is the only case the two readings place differently |
+| Self-match prevention | A skipped order carries the same attribution as the executed one | 0. Only 73 of the executed orders were attributed at all, so the feed can hardly test this |
+| Halts | The stock was not in state `T` | 0 |
+| A different message type | The executions are `C`, or non-printable | All are `E` by construction, and `E` has no printable flag. `C` is counted apart, above |
+| Auctions and time of day | They sit at the open or the close | 9,052 (86%) fall between 09:30 and 10:00, and 108 in the last half-hour. None before 09:30 or after 16:00. They are spread over 436 stocks |
+
+None of these explains the set. Most skipped orders traded soon after. Of the 88,133 times an order was skipped, its next message was an execution in the same nanosecond 36,499 times, a later execution 25,707 times, a delete 25,846 times and a partial cancel 81 times.
+
+### The opening bursts
+
+This part was found by looking at the 10,565 rows, so it is post hoc.
+
+In the 40 seconds after 09:30 the feed carries bursts of Add Order messages: many adds for one stock, back to back, with one timestamp. Define a burst as three or more consecutive add messages (`A` or `F`) with the same stock and the same timestamp. The threshold of three was chosen after seeing the data. It matters little: the shortest burst behind any out-of-turn execution has 12 messages.
+
+| | |
+|---|---:|
+| Bursts in the day | 45,586 |
+| Orders added in bursts | 944,183 |
+| Stocks with a burst | 8,818 of 8,906 |
+| Longest burst | 90 messages |
+| First burst | 09:30:00.000995 |
+| Last burst | 09:30:39.737184 |
+| Bursts at any other time of day | 0 |
+
+The bursts arrive about one a millisecond for 40 seconds and never again. That pattern is a machine loading a batch of orders into the book. Executions split on it:
+
+| | Executions (`E`) | Out of turn |
+|---|---:|---:|
+| Against an order added in a burst | 37,761 | 10,565 (28.0%) |
+| Against any other order | 5,685,063 | 0 |
+
+Every out-of-turn execution hit a burst order, and every order it skipped was an ordinary one. In each case the burst order was added after its own stock's opening cross message. The 10,565 executions involve 8,986 distinct orders in 436 stocks. All but one of the executions were in Nasdaq-listed stocks.
+
+On this day an order that entered the book in an opening burst can rank ahead of orders whose add messages came earlier, and an ordinary order never does.
+
+### A test that could have failed
+
+If burst orders really sit ahead of what they skipped, the damage should be one-off: once the rebuilt queue is corrected for an order, nothing further should be out of turn. The analysis runs a second replay beside the first. In it, the first time a burst order is executed out of turn it is moved to the front of its queue. Then it counts what is still out of turn.
+
+| Second replay | |
+|---|---:|
+| Burst orders moved to the front | 8,986 |
+| Executed out of turn again after the move | 0 |
+| Out-of-turn executions of an order that is not a burst order | 0 |
+
+Had a moved order been behind something after all, the order it jumped would later have traded past it and shown up in the last two rows. Nothing did, across 5.7 million executions.
+
+### What the bursts probably are
+
+The feed does not say, and no Nasdaq document I read states it, so this is inference.
+
+Nasdaq accepts orders before the open that cannot trade until regular hours. Its Opening and Closing Crosses FAQ says regular-hours orders are executable from 09:30 to 16:00, and lists order types that are accepted hours earlier. The ITCH specification's Start of Market Hours system event (section 1.1) says it marks the point where market-hours orders become available for execution. Such an order is not on the displayed book before 09:30, so the feed cannot show it until then. The same FAQ says of one order type that is re-priced at the open that it keeps its original time of entry for time priority.
+
+If the bursts are those held orders reaching the book, and they keep the time they were entered, then a burst order entered at 08:00 belongs ahead of a displayed order added at 09:00, although its add message came later. An add message carries the time it was sent and nothing else, so no book built from this feed can place those orders correctly in advance. That fits every count above.
+
+### What is still not explained
+
+- The cause is inferred. The counts show which orders jump the queue. They do not show why Nasdaq ranks them so.
+- Not every burst order jumps. 27,196 executions of burst orders were in turn. On the reading above those orders were entered later than what rested ahead of them, but the feed cannot confirm it.
+- The move-to-front rule is a repair after the fact. It shows the anomalies are consistent with one hidden ranking, without recovering that ranking.
+- One day. Another day might show out-of-turn executions that bursts do not cover.
 
 ## Differences from the source
 
 - The framing of the file is not in the specification (see "What is not in the specification").
-- The book is crossed during halts and pauses. The design promised a book that never crosses.
-- 10,565 of 5,722,824 `E` executions (0.185%) do not follow the price-time order of the rebuilt queue.
+- The book is crossed during halts and pauses. The specification does not say so.
+- 10,565 of 5,722,824 `E` executions (0.185%) do not follow the price-time order of the rebuilt queue. All of them hit orders added in the opening bursts. The specification does not describe those bursts or how such orders rank.
 - Where a replaced order goes in the queue is this project's reading. The specification is silent.
-- The design called for a golden test on the first million messages of a sample day. That test exists and passes here (`tests/golden.rs`, digest `8b546eda1fe37dee`), but it is skipped wherever the data file is absent, which includes CI. CI runs the same kind of test on the committed synthetic stream and on one million generated messages.
+- The golden test on the first million messages of the real day (`tests/golden.rs`, digest `8b546eda1fe37dee`) is skipped wherever the data file is absent, which includes CI. CI runs the same kind of test on the committed synthetic stream and on one million generated messages.
 
 ## Variants tried
 
-Two things were tried in more than one way. Nothing else was tuned.
+Everything that was tried in more than one way is listed here, including what did not help.
 
-1. Queue position after Order Replace, two readings, each run once on the full day:
+1. Queue position after Order Replace, two readings, each run on the full day:
 
-   | Reading | `E` executions not taking the oldest order |
-   |---|---:|
-   | Every replacement goes to the back of the queue (used for all results) | 10,565 |
-   | A replacement at the same price for no more shares keeps its place | 11,153 |
+   | Reading | `E` executions out of turn | Of those, not explained by an opening burst |
+   |---|---:|---:|
+   | Every replacement goes to the back of the queue (used for all results) | 10,565 | 0 |
+   | A replacement at the same price for no more shares keeps its place | 11,153 | 588 |
 
-   The first reading fits better and is the default. The second is still in the code (`agora replay --check --replace-keeps-priority`) so the comparison can be rerun. Both readings give the same final books, crossed counts and ledger.
+   The first reading is the default. The second is still in the code (`agora replay --check --replace-keeps-priority`, `agora priority --replace-keeps-priority`) so the comparison can be rerun. Both give the same final books, crossed counts and ledger.
 
-2. The full reproduce was run twice. Throughput moved between runs on this shared machine:
+2. The order reference index, three ways. Each benchmark round times all three, and the property tests check that all three build the same books.
 
-   | Run | Three timed replays (seconds) | Median |
-   |---|---|---:|
-   | First, before the replace comparison was added | 55.740, 48.202, 47.180 | 48.202 |
-   | Second, the one committed in `results/` | 54.649, 54.905, 49.086 | 54.649 |
+   - The standard hash map with a one-multiply hasher. This is what the first version used.
+   - A page table indexed by the reference number itself (`PageIndex`). Nasdaq hands out reference numbers in rising order, so new orders would sit next to each other in memory. It was slower. Orders that rest for hours are scattered through the number range and each one keeps a 64 KiB page alive, so the table grows to 4.4 GB to hold under two million orders.
+   - An open-addressing hash table with linear probing (`OpenIndex`), now the default. At its largest it holds 101 MB, against an estimated 92 MB for the standard map. Its use is that the slot a reference will land in is known from the reference alone, so it can be prefetched.
 
-   The README quotes the committed run. The data structures were not changed between the two runs.
+   What each index holds through the day (`results/index_memory.csv`):
 
-No performance variants were tried. The book, the order map and the reader are the first versions written.
+| Time of day | Orders resting | Standard hash map (estimate) | Page table | Open table |
+|---|---:|---:|---:|---:|
+| 07:00:00 | 7,574 | 0 MB | 50 MB | 0 MB |
+| 09:30:00 | 414,434 | 11 MB | 153 MB | 25 MB |
+| 09:35:00 | 1,653,863 | 92 MB | 262 MB | 101 MB |
+| 11:00:00 | 1,756,394 | 92 MB | 1,800 MB | 101 MB |
+| 13:00:00 | 1,789,421 | 92 MB | 3,065 MB | 101 MB |
+| 15:00:00 | 1,789,757 | 92 MB | 4,060 MB | 101 MB |
+| 16:00:00 | 1,758,807 | 92 MB | 4,382 MB | 101 MB |
+| 18:00:00 | 147,778 | 92 MB | 1,348 MB | 101 MB |
 
-## How the timing was measured
+3. Batching with prefetch. The replay can parse 32 messages ahead, tell the CPU which index slots, orders and queue neighbours they will touch, and then apply them in order. The books are the same; the property tests and the checkpoint digests check that. Batch sizes of 8, 16, 32, 64 and 128 were each run twice on a busy machine and could not be told apart, so 32 stayed. A further hint for add messages (the slot the order will take and the order it will queue behind) showed no gain in the same rough test and was removed.
 
-- Machine: Intel Core i9-13900K, 64 GB, Windows 11, Rust 1.97.0, release profile with fat LTO and one codegen unit. The process is single-threaded and was not pinned to a core. Other programs were running.
-- The timed replay reads the decompressed file from disk through a 4 MiB buffer, parses every message and applies it. The file was in the operating system's cache: a parse-only pass runs twice first. Reading and parsing alone take 4.9 s of the 54.6 s.
-- Per-message latency is the time-stamp counter read before parsing a message and after applying it, in a separate pass. Ticks are converted to nanoseconds by comparing the counter with the system clock over the whole pass. An empty measurement costs about 5 ns (median) and is not subtracted. Percentiles come from a histogram with buckets about 3% wide; the maximum is exact.
-- The per-message numbers measure one message with the next one not yet parsed. They are the cost of this code on a cache-warm file, and say nothing about a network feed.
+4. Not tried: a different price-level structure, a different parser, or a custom allocator. The stage breakdown below says where they would have to help.
+
+## How fast
+
+All numbers are from `results/`, written by `agora reproduce` (which ends by running `agora bench`).
+
+### Method
+
+- The benchmark thread is pinned to one logical CPU (number 2, a performance core on this machine) and raised to the highest thread priority.
+- Warm-up, not timed: one parse pass to pull the file into the operating system's cache, then one full replay.
+- Then ten rounds. Each round runs every pass once, in the same order, so drift on the machine lands on all of them alike. The tables give the minimum, median and maximum over the ten rounds.
+- Every timed replay must end with the same message, order and share counts as the checked pass, or the run stops.
+- The run reads machine-wide CPU time before and after the rounds and reports how much work everything else on the machine did in that time.
+- Machine: Intel Core i9-13900K, 64 GB, Windows 11, Rust 1.97.0, release profile with fat LTO and one codegen unit. The file is read from the operating system's cache through a 4 MiB buffer.
+
+The machine was not quiet. Other programs used about 6.1 of its 32 logical CPUs over the timed rounds. Rounds 5 to 8 ran while they were busiest, and the replay passes took up to twice as long in those rounds as in the others. Pinning and priority keep the benchmark thread on its core, but they do not stop other programs from competing for memory and cache, and this workload is mostly memory. The minimum of each pass is the best estimate of what the code costs; the median is what this machine delivered that hour.
+
+### The day, ten times
+
+| Pass | Fastest | Median | Slowest | ns a message (median) |
+|---|---:|---:|---:|---:|
+| Read the file and split it into messages | 1.8 s | 1.9 s | 2.8 s | 7 |
+| Read and parse | 4.6 s | 4.8 s | 6.6 s | 18 |
+| Read, parse, order lookups only: standard hash map | 16.0 s | 18.4 s | 33.8 s | 69 |
+| Read, parse, order lookups only: page table | 12.5 s | 15.8 s | 25.3 s | 59 |
+| Read, parse, order lookups only: open table | 21.0 s | 22.0 s | 31.2 s | 82 |
+| Replay, standard hash map (the first version) | 47.2 s | 56.7 s | 97.9 s | 211 |
+| Replay, page table | 55.8 s | 73.2 s | 163.9 s | 272 |
+| Replay, open table | 50.6 s | 58.5 s | 88.2 s | 218 |
+| Replay in batches of 32 with prefetch, standard hash map | 33.1 s | 37.8 s | 56.6 s | 141 |
+| Replay in batches of 32 with prefetch, open table | 31.7 s | 34.2 s | 51.2 s | 127 |
+| Replay with every check on, open table | 53.1 s | 61.9 s | 87.9 s | 230 |
+| Replay with per-message timing, open table | 58.6 s | 67.5 s | 98.1 s | 251 |
+
+`results/throughput_runs.csv` has each of the ten timings of every pass.
+
+### Before and after
+
+The same rounds time the three order indexes one message at a time, and two of them in batches of 32 with prefetch.
+
+| Order index | Messages applied | Fastest | Median | Slowest | Median ns a message | Median million a second | Median against the first version |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Standard hash map (the first version) | One at a time | 47.2 s | 56.7 s | 97.9 s | 211 | 4.74 | 1.00x |
+| Page table | One at a time | 55.8 s | 73.2 s | 163.9 s | 272 | 3.67 | 0.77x |
+| Open table | One at a time | 50.6 s | 58.5 s | 88.2 s | 218 | 4.59 | 0.97x |
+| Standard hash map (the first version) | 32 at a time with prefetch | 33.1 s | 37.8 s | 56.6 s | 141 | 7.11 | 1.50x |
+| Open table | 32 at a time with prefetch | 31.7 s | 34.2 s | 51.2 s | 127 | 7.85 | 1.66x |
+
+One message at a time, the standard hash map is the fastest of the three. On the medians the open table is 3% slower and the page table 29% slower; on the fastest runs the open table is 7% slower. In the busy rounds the order flips and the open table is ahead, which I have not explained.
+
+Batching with prefetch is what helps: 1.66x on the medians with the open table and 1.50x with the standard map, whose slots cannot be prefetched. So most of the gain is from fetching orders and queue neighbours early, and the open table adds the rest. On the fastest run of each pass the two ratios are 1.49x and 1.43x.
+
+The first version as committed (`c13e4bc`) reported 54.6 s, the median of three unpinned runs. The standard-hash-map row is that structure in today's code, which also carries the generation check on every handle.
+
+### Where the time goes
+
+No sampling profiler was used. The breakdown comes from passes that each do one thing more than the last: read the file and split it into messages; also parse; also do the order reference lookups a replay would do, with no book; the whole replay. The differences between their medians give the stages.
+
+| Stage, ns a message | Standard hash map | Page table | Open table |
+|---|---:|---:|---:|
+| Read the file and split it into messages | 7 | 7 | 7 |
+| Parse | 11 | 11 | 11 |
+| Order reference lookup | 51 | 41 | 64 |
+| Book update and counters | 142 | 214 | 136 |
+| Whole replay | 211 | 272 | 218 |
+
+Reading and parsing are 18 ns of a message. The rest is the order lookup and the book update, and the split between those two is rough: the lookup-only pass has no book competing for cache, so it flatters whichever index uses more memory. The page table shows this. Its lookups look cheapest alone (41 ns) and its book stage is the dearest (214 ns), because its gigabytes push the books out of cache.
+
+Batching with prefetch takes the open table's lookup and book stages together from 200 to 109 ns. Prefetch changes nothing but when memory is fetched, so about that much of the time was waiting for memory.
+
+### What per-message timing costs
+
+Per-message latency is the time-stamp counter read before parsing a message and after applying it, in a separate pass, one message at a time. Ticks are converted to nanoseconds by comparing the counter with the system clock over the whole pass. Percentiles come from a histogram whose buckets are 1/32 of their value wide. A percentile is the middle of its bucket, so it is within 1.6% of the true value; values under 64 ticks (21 ns) and the maximum are exact.
+
+| | |
+|---|---:|
+| Replay, one message at a time | 218 ns a message |
+| The same with a clock read before and after every message | 251 ns a message |
+| What timing adds to the pass | 34 ns a message |
+| Mean of the per-message measurements | 227 ns |
+| Two clock reads back to back, median | 5 ns |
+
+Timing every message adds 34 ns a message to the pass. Two clock reads back to back take 5 ns, but that figure leaves out what the reads do to the code around them and the cost of recording the result. The percentiles include the part of the cost that falls between the two reads, so they run a little high; the mean of the measurements is 227 ns against 218 ns a message for the untimed replay.
+
+The per-message numbers time one message with the next one not yet parsed. They are the cost of this code on a cache-warm file, and say nothing about a network feed.
 
 ## Could not verify
 
 - The download against Nasdaq's own checksum (404, above).
 - The licence of the sample files. The directory states none.
-- The cause of the 10,565 out-of-order `E` executions.
+- Why opening-burst orders rank ahead of orders with earlier add messages. The counts are firm; the cause is inferred.
 - That the rebuilt books equal Nasdaq's own. There is no public snapshot to compare with. The evidence is internal: no message contradicts the book it is applied to, volume balances to zero, and every book is empty at the end.
 - The parsers for `W`, `h`, `B`, `N` and `O` against real messages.
-- CI. The workflow is committed; whether it ran is in the hand-over note, not here.
+- The timings on a quiet machine. Other programs used about 6.1 CPUs during the benchmark and I could not stop them.

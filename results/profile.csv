@@ -1,0 +1,6 @@
+stage,std_hash_map_ns_per_message,page_table_ns_per_message,open_table_ns_per_message
+read the file and split it into messages,7.0,7.0,7.0
+parse,11.0,11.0,11.0
+order reference lookup,50.7,40.7,64.0
+book update and counters,142.4,213.7,135.8
+whole replay,211.0,272.4,217.7
