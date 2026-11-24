@@ -62,6 +62,7 @@ pub fn invariants_csv(stats: &Stats, audit: &Audit, parse_errors: u64) -> String
     row("over_reduce", stats.over_reduce.to_string());
     row("locate_mismatch", stats.locate_mismatch.to_string());
     row("zero_share_add", stats.zero_share_add.to_string());
+    row("book_faults", stats.book_faults.to_string());
     row("orders_added", stats.orders_added.to_string());
     row("peak_live_orders", stats.peak_live_orders.to_string());
     row("shares_added", stats.shares_added.to_string());

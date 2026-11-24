@@ -1,7 +1,7 @@
 //! Golden tests: fixed inputs, fixed fingerprints.
 //!
-//! The design called for a golden test on the first million messages of a
-//! real sample day. That file cannot be committed, so there are three tests:
+//! The first million messages of the real day would be the natural golden
+//! input, but that file cannot be committed, so there are three tests:
 //!
 //! 1. the committed synthetic stream (`tests/data/synthetic.itch`) against a
 //!    pinned digest, which runs everywhere;

@@ -9,6 +9,7 @@ duplicate_order_ref,0
 over_reduce,0
 locate_mismatch,0
 zero_share_add,0
+book_faults,0
 orders_added,140270523
 peak_live_orders,1924078
 shares_added,47597537971
@@ -46,6 +47,4 @@ executions_C_oldest_at_best_price,17268
 printed_shares,856824388
 non_printable_shares,3754970
 cross_shares,114191631
-book_digest,cbf29ce484222325
 file_bytes,8251407909
-book_digest_after_first_million,8b546eda1fe37dee

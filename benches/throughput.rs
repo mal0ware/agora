@@ -6,7 +6,7 @@
 
 use std::hint::black_box;
 
-use agora::book::{Book, Side};
+use agora::book::{Book, Handle, Side};
 use agora::engine::Engine;
 use agora::itch::{parse, FrameReader};
 use agora::replay::Replay;
@@ -66,14 +66,14 @@ fn bench_replay(c: &mut Criterion) {
     group.finish();
 }
 
-fn deep_book() -> (Book, Vec<u32>) {
+fn deep_book() -> (Book, Vec<Handle>) {
     let mut book = Book::new();
     let mut slots = Vec::new();
     for level in 0..200u32 {
         for k in 0..5u64 {
             let id = u64::from(level) * 10 + k;
-            slots.push(book.add(id, Side::Buy, 10_000 - level, 100));
-            slots.push(book.add(id + 5, Side::Sell, 10_003 + level, 100));
+            slots.push(book.add(id, Side::Buy, 10_000 - level, 100).unwrap());
+            slots.push(book.add(id + 5, Side::Sell, 10_003 + level, 100).unwrap());
         }
     }
     (book, slots)
@@ -84,21 +84,27 @@ fn bench_book(c: &mut Criterion) {
     group.bench_function("add_then_remove_at_best", |b| {
         let (mut book, _) = deep_book();
         b.iter(|| {
-            let slot = book.add(u64::MAX, Side::Buy, black_box(10_000), 100);
+            let slot = book
+                .add(u64::MAX, Side::Buy, black_box(10_000), 100)
+                .unwrap();
             book.remove(slot)
         })
     });
     group.bench_function("add_then_remove_150_levels_deep", |b| {
         let (mut book, _) = deep_book();
         b.iter(|| {
-            let slot = book.add(u64::MAX, Side::Buy, black_box(9_850), 100);
+            let slot = book
+                .add(u64::MAX, Side::Buy, black_box(9_850), 100)
+                .unwrap();
             book.remove(slot)
         })
     });
     group.bench_function("new_level_inside_spread_then_remove", |b| {
         let (mut book, _) = deep_book();
         b.iter(|| {
-            let slot = book.add(u64::MAX, Side::Sell, black_box(10_001), 100);
+            let slot = book
+                .add(u64::MAX, Side::Sell, black_box(10_001), 100)
+                .unwrap();
             book.remove(slot)
         })
     });
@@ -107,7 +113,7 @@ fn bench_book(c: &mut Criterion) {
             deep_book,
             |(book, slots)| {
                 for &s in slots.iter() {
-                    black_box(book.reduce(s, 1));
+                    black_box(book.reduce(s, 1).unwrap());
                 }
             },
             BatchSize::LargeInput,

@@ -9,6 +9,7 @@ duplicate_order_ref,0
 over_reduce,0
 locate_mismatch,0
 zero_share_add,0
+book_faults,0
 orders_added,24916
 peak_live_orders,5721
 shares_added,12316203

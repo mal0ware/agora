@@ -5,12 +5,60 @@
 //! price is the last element, which makes the common case (activity at or near
 //! the top of the book) a short scan from the end.
 //!
+//! A resting order is named by a [`Handle`]: a slot number and the slot's
+//! generation. Releasing a slot bumps its generation, so a handle kept past
+//! the life of its order is refused with [`BookError::StaleHandle`] instead
+//! of reaching whatever order took the slot next. The check is one compare
+//! on a cache line the operation reads anyway.
+//!
 //! The book is passive: `add` never matches. Matching lives in
 //! [`crate::engine::Engine`]; replay of an exchange feed lives in
 //! [`crate::replay::Replay`], where the exchange has already done the matching.
 
 /// Sentinel for "no order" in the intrusive queue links.
-pub const NIL: u32 = u32::MAX;
+const NIL: u32 = u32::MAX;
+
+/// Names one resting order in one [`Book`].
+///
+/// A handle is only meaningful to the book that issued it. It stops working
+/// when its order's quantity reaches zero. A slot's generation wraps after
+/// 2^32 releases of that one slot, which is the only way a stale handle could
+/// be accepted again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Handle {
+    index: u32,
+    generation: u32,
+}
+
+/// Why the book refused a request. The book is unchanged when it refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookError {
+    /// An order must have positive quantity.
+    ZeroQuantity,
+    /// The handle names an order that no longer rests (or never did).
+    StaleHandle,
+    /// A reduction asked for more than the order has left.
+    ExceedsRemaining {
+        /// Quantity asked for.
+        asked: u32,
+        /// Quantity available.
+        remaining: u32,
+    },
+}
+
+impl std::fmt::Display for BookError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BookError::ZeroQuantity => write!(f, "an order must have positive quantity"),
+            BookError::StaleHandle => write!(f, "the handle's order no longer rests"),
+            BookError::ExceedsRemaining { asked, remaining } => {
+                write!(f, "asked for {asked} but only {remaining} remain")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BookError {}
 
 /// How many levels to scan from the top of the book before falling back to a
 /// binary search.
@@ -44,6 +92,8 @@ struct Order {
     qty: u32,
     prev: u32,
     next: u32,
+    /// Bumped every time the slot is released.
+    generation: u32,
     side: Side,
 }
 
@@ -114,29 +164,79 @@ impl Book {
         Self::default()
     }
 
+    /// The live order a handle names.
+    #[inline]
+    fn live(&self, handle: Handle) -> Result<&Order, BookError> {
+        match self.orders.get(handle.index as usize) {
+            Some(o) if o.generation == handle.generation && o.qty > 0 => Ok(o),
+            _ => Err(BookError::StaleHandle),
+        }
+    }
+
+    /// Hint that the order `handle` names is about to be used. Changes
+    /// nothing and is safe with a stale handle.
+    #[inline]
+    pub fn prefetch(&self, handle: Handle) {
+        if let Some(o) = self.orders.get(handle.index as usize) {
+            crate::mem::prefetch(o);
+        }
+    }
+
+    /// Hint that the order `handle` names is about to be removed: start
+    /// loading its neighbours in the queue and the best level on its side.
+    /// Changes nothing and is safe with a stale handle.
+    #[inline]
+    pub fn prefetch_links(&self, handle: Handle) {
+        let Some(o) = self.orders.get(handle.index as usize) else {
+            return;
+        };
+        if let Some(prev) = self.orders.get(o.prev as usize) {
+            crate::mem::prefetch(prev);
+        }
+        if let Some(next) = self.orders.get(o.next as usize) {
+            crate::mem::prefetch(next);
+        }
+        if let Some(level) = self.side_levels(o.side).last() {
+            crate::mem::prefetch(level);
+        }
+    }
+
     /// Rest a new order at the back of the queue at its price.
     ///
-    /// Returns a slot handle that stays valid until the order's quantity
-    /// reaches zero. `qty` must be positive. This never matches, so the caller
-    /// decides whether a crossing price is legal.
-    pub fn add(&mut self, id: u64, side: Side, price: u32, qty: u32) -> u32 {
-        assert!(qty > 0, "an order must have positive quantity");
-        let order = Order {
-            id,
-            price,
-            qty,
-            prev: NIL,
-            next: NIL,
-            side,
-        };
-        let slot = match self.free.pop() {
+    /// Returns a handle that stays valid until the order's quantity reaches
+    /// zero. This never matches, so the caller decides whether a crossing
+    /// price is legal. A zero quantity is refused.
+    #[inline]
+    pub fn add(&mut self, id: u64, side: Side, price: u32, qty: u32) -> Result<Handle, BookError> {
+        if qty == 0 {
+            return Err(BookError::ZeroQuantity);
+        }
+        let (slot, generation) = match self.free.pop() {
             Some(s) => {
-                self.orders[s as usize] = order;
-                s
+                let o = &mut self.orders[s as usize];
+                let generation = o.generation;
+                *o = Order {
+                    id,
+                    price,
+                    qty,
+                    prev: NIL,
+                    next: NIL,
+                    generation,
+                    side,
+                };
+                (s, generation)
             }
             None => {
-                self.orders.push(order);
-                (self.orders.len() - 1) as u32
+                self.orders.push(Order {
+                    id,
+                    price,
+                    qty,
+                    prev: NIL,
+                    next: NIL,
+                    generation: 0,
+                    side,
+                });
+                ((self.orders.len() - 1) as u32, 0)
             }
         };
         let levels = match side {
@@ -170,19 +270,35 @@ impl Book {
             self.orders[tail as usize].next = slot;
             self.orders[slot as usize].prev = tail;
         }
-        slot
+        Ok(Handle {
+            index: slot,
+            generation,
+        })
     }
 
     /// Take `qty` off a resting order, keeping its place in the queue.
     ///
     /// Returns the remaining quantity. At zero the order is removed and its
-    /// slot is released. `qty` must not exceed the order's remaining quantity.
-    pub fn reduce(&mut self, slot: u32, qty: u32) -> u32 {
-        let order = &mut self.orders[slot as usize];
-        assert!(qty <= order.qty, "reduce exceeds remaining quantity");
-        order.qty -= qty;
-        let (side, price, remaining, prev, next) =
-            (order.side, order.price, order.qty, order.prev, order.next);
+    /// handle stops working. A stale handle, or a `qty` above what the order
+    /// has left, is refused and changes nothing.
+    #[inline]
+    pub fn reduce(&mut self, handle: Handle, qty: u32) -> Result<u32, BookError> {
+        let order = self.live(handle)?;
+        if qty > order.qty {
+            return Err(BookError::ExceedsRemaining {
+                asked: qty,
+                remaining: order.qty,
+            });
+        }
+        let slot = handle.index;
+        let (side, price, remaining, prev, next) = (
+            order.side,
+            order.price,
+            order.qty - qty,
+            order.prev,
+            order.next,
+        );
+        self.orders[slot as usize].qty = remaining;
         let levels = match side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
@@ -205,20 +321,21 @@ impl Book {
             if level.count == 0 {
                 levels.remove(pos);
             }
+            let o = &mut self.orders[slot as usize];
+            o.generation = o.generation.wrapping_add(1);
             self.free.push(slot);
         }
-        remaining
+        Ok(remaining)
     }
 
     /// Move a resting order to the front of the queue at its price.
-    pub fn move_to_front(&mut self, slot: u32) {
-        let (side, price, prev, next) = {
-            let o = &self.orders[slot as usize];
-            (o.side, o.price, o.prev, o.next)
-        };
+    pub fn move_to_front(&mut self, handle: Handle) -> Result<(), BookError> {
+        let o = self.live(handle)?;
+        let (side, price, prev, next) = (o.side, o.price, o.prev, o.next);
         if prev == NIL {
-            return;
+            return Ok(());
         }
+        let slot = handle.index;
         let levels = match side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
@@ -236,30 +353,33 @@ impl Book {
         self.orders[head as usize].prev = slot;
         self.orders[slot as usize].prev = NIL;
         self.orders[slot as usize].next = head;
+        Ok(())
     }
 
     /// Give a resting order a new identifier without moving it in its queue.
-    pub fn set_id(&mut self, slot: u32, id: u64) {
-        self.orders[slot as usize].id = id;
+    pub fn set_id(&mut self, handle: Handle, id: u64) -> Result<(), BookError> {
+        self.live(handle)?;
+        self.orders[handle.index as usize].id = id;
+        Ok(())
     }
 
     /// Remove a resting order outright. Returns the quantity it still had.
-    pub fn remove(&mut self, slot: u32) -> u32 {
-        let qty = self.orders[slot as usize].qty;
-        self.reduce(slot, qty);
-        qty
+    #[inline]
+    pub fn remove(&mut self, handle: Handle) -> Result<u32, BookError> {
+        let qty = self.live(handle)?.qty;
+        self.reduce(handle, qty)?;
+        Ok(qty)
     }
 
-    /// The order in `slot`. A released slot reads as quantity zero.
+    /// The order a handle names, or `None` if it no longer rests.
     #[inline]
-    pub fn get(&self, slot: u32) -> OrderView {
-        let o = &self.orders[slot as usize];
-        OrderView {
+    pub fn get(&self, handle: Handle) -> Option<OrderView> {
+        self.live(handle).ok().map(|o| OrderView {
             id: o.id,
             side: o.side,
             price: o.price,
             qty: o.qty,
-        }
+        })
     }
 
     #[inline]
@@ -292,10 +412,13 @@ impl Book {
         self.asks.last().map(|l| l.price)
     }
 
-    /// Slot of the oldest order at the best price on `side`.
+    /// The oldest order at the best price on `side`.
     #[inline]
-    pub fn front(&self, side: Side) -> Option<u32> {
-        self.side_levels(side).last().map(|l| l.head)
+    pub fn front(&self, side: Side) -> Option<Handle> {
+        self.side_levels(side).last().map(|l| Handle {
+            index: l.head,
+            generation: self.orders[l.head as usize].generation,
+        })
     }
 
     /// True when the best bid is strictly above the best ask.
@@ -316,19 +439,22 @@ impl Book {
         }
     }
 
-    /// True when the order in `slot` rests at the best price on its side.
+    /// True when the order rests at the best price on its side. False for a
+    /// stale handle.
     #[inline]
-    pub fn at_best(&self, slot: u32) -> bool {
-        let o = &self.orders[slot as usize];
-        self.side_levels(o.side)
-            .last()
-            .is_some_and(|l| l.price == o.price)
+    pub fn at_best(&self, handle: Handle) -> bool {
+        self.live(handle).is_ok_and(|o| {
+            self.side_levels(o.side)
+                .last()
+                .is_some_and(|l| l.price == o.price)
+        })
     }
 
-    /// True when the order in `slot` is the oldest at its price.
+    /// True when the order is the oldest at its price. False for a stale
+    /// handle.
     #[inline]
-    pub fn at_head(&self, slot: u32) -> bool {
-        self.orders[slot as usize].prev == NIL
+    pub fn at_head(&self, handle: Handle) -> bool {
+        self.live(handle).is_ok_and(|o| o.prev == NIL)
     }
 
     /// Levels on `side`, best first.
@@ -527,15 +653,19 @@ pub fn digest_books<'a>(books: impl Iterator<Item = (u64, &'a Book)>) -> u64 {
 mod tests {
     use super::*;
 
+    fn add(b: &mut Book, id: u64, side: Side, price: u32, qty: u32) -> Handle {
+        b.add(id, side, price, qty).unwrap()
+    }
+
     #[test]
     fn add_builds_levels_best_last() {
         let mut b = Book::new();
-        b.add(1, Side::Buy, 100, 10);
-        b.add(2, Side::Buy, 102, 5);
-        b.add(3, Side::Buy, 101, 7);
-        b.add(4, Side::Sell, 105, 1);
-        b.add(5, Side::Sell, 103, 2);
-        b.add(6, Side::Sell, 104, 3);
+        add(&mut b, 1, Side::Buy, 100, 10);
+        add(&mut b, 2, Side::Buy, 102, 5);
+        add(&mut b, 3, Side::Buy, 101, 7);
+        add(&mut b, 4, Side::Sell, 105, 1);
+        add(&mut b, 5, Side::Sell, 103, 2);
+        add(&mut b, 6, Side::Sell, 104, 3);
         assert_eq!(b.best_bid(), Some(102));
         assert_eq!(b.best_ask(), Some(103));
         let bids: Vec<u32> = b.levels(Side::Buy).map(|l| l.price).collect();
@@ -549,9 +679,9 @@ mod tests {
     #[test]
     fn queue_is_first_in_first_out() {
         let mut b = Book::new();
-        let s1 = b.add(1, Side::Sell, 50, 10);
-        let s2 = b.add(2, Side::Sell, 50, 20);
-        let s3 = b.add(3, Side::Sell, 50, 30);
+        let s1 = add(&mut b, 1, Side::Sell, 50, 10);
+        let s2 = add(&mut b, 2, Side::Sell, 50, 20);
+        let s3 = add(&mut b, 3, Side::Sell, 50, 30);
         assert_eq!(b.front(Side::Sell), Some(s1));
         assert!(b.at_head(s1) && !b.at_head(s2) && !b.at_head(s3));
         let ids: Vec<u64> = b.queue(Side::Sell, 50).map(|o| o.id).collect();
@@ -565,7 +695,7 @@ mod tests {
             })
         );
         // Removing the middle order keeps the others in order.
-        assert_eq!(b.remove(s2), 20);
+        assert_eq!(b.remove(s2), Ok(20));
         let ids: Vec<u64> = b.queue(Side::Sell, 50).map(|o| o.id).collect();
         assert_eq!(ids, [1, 3]);
         b.audit().unwrap();
@@ -574,9 +704,9 @@ mod tests {
     #[test]
     fn partial_reduce_keeps_priority() {
         let mut b = Book::new();
-        let s1 = b.add(1, Side::Buy, 10, 100);
-        b.add(2, Side::Buy, 10, 100);
-        assert_eq!(b.reduce(s1, 40), 60);
+        let s1 = add(&mut b, 1, Side::Buy, 10, 100);
+        add(&mut b, 2, Side::Buy, 10, 100);
+        assert_eq!(b.reduce(s1, 40), Ok(60));
         assert_eq!(b.front(Side::Buy), Some(s1));
         assert_eq!(b.best(Side::Buy).unwrap().qty, 160);
         b.audit().unwrap();
@@ -585,58 +715,116 @@ mod tests {
     #[test]
     fn emptying_a_level_removes_it_and_reuses_the_slot() {
         let mut b = Book::new();
-        let s1 = b.add(1, Side::Buy, 10, 5);
-        b.add(2, Side::Buy, 9, 5);
-        assert_eq!(b.reduce(s1, 5), 0);
+        let s1 = add(&mut b, 1, Side::Buy, 10, 5);
+        add(&mut b, 2, Side::Buy, 9, 5);
+        assert_eq!(b.reduce(s1, 5), Ok(0));
         assert_eq!(b.best_bid(), Some(9));
         assert_eq!(b.order_count(), 1);
-        let s3 = b.add(3, Side::Sell, 11, 1);
-        assert_eq!(s3, s1);
-        assert_eq!(b.get(s3).id, 3);
+        let s3 = add(&mut b, 3, Side::Sell, 11, 1);
+        // Same slot, new generation: the handles differ.
+        assert_eq!(s3.index, s1.index);
+        assert_ne!(s3, s1);
+        assert_eq!(b.get(s3).unwrap().id, 3);
+        b.audit().unwrap();
+    }
+
+    #[test]
+    fn a_stale_handle_is_refused_and_changes_nothing() {
+        let mut b = Book::new();
+        let old = add(&mut b, 1, Side::Buy, 10, 5);
+        assert_eq!(b.remove(old), Ok(5));
+        // The slot is reused by a different order at a different price.
+        let new = add(&mut b, 2, Side::Sell, 20, 7);
+        assert_eq!(new.index, old.index);
+        let before = digest_books([(1u64, &b)].into_iter());
+        assert_eq!(b.reduce(old, 1), Err(BookError::StaleHandle));
+        assert_eq!(b.remove(old), Err(BookError::StaleHandle));
+        assert_eq!(b.set_id(old, 9), Err(BookError::StaleHandle));
+        assert_eq!(b.move_to_front(old), Err(BookError::StaleHandle));
+        assert_eq!(b.get(old), None);
+        assert!(!b.at_best(old) && !b.at_head(old));
+        assert_eq!(digest_books([(1u64, &b)].into_iter()), before);
+        assert_eq!(b.get(new).unwrap().qty, 7);
+        b.audit().unwrap();
+        // A handle from nowhere is refused too.
+        let bogus = Handle {
+            index: 1_000,
+            generation: 0,
+        };
+        assert_eq!(b.reduce(bogus, 1), Err(BookError::StaleHandle));
+    }
+
+    #[test]
+    fn zero_quantity_and_over_reduce_are_errors() {
+        let mut b = Book::new();
+        assert_eq!(b.add(1, Side::Buy, 1, 0), Err(BookError::ZeroQuantity));
+        assert!(b.is_empty());
+        let s = add(&mut b, 1, Side::Buy, 1, 1);
+        assert_eq!(
+            b.reduce(s, 2),
+            Err(BookError::ExceedsRemaining {
+                asked: 2,
+                remaining: 1
+            })
+        );
+        assert_eq!(b.get(s).unwrap().qty, 1);
+        // Taking nothing is allowed and changes nothing.
+        assert_eq!(b.reduce(s, 0), Ok(1));
         b.audit().unwrap();
     }
 
     #[test]
     fn crossed_and_locked_are_reported() {
         let mut b = Book::new();
-        b.add(1, Side::Buy, 100, 1);
-        let ask = b.add(2, Side::Sell, 100, 1);
+        add(&mut b, 1, Side::Buy, 100, 1);
+        let ask = add(&mut b, 2, Side::Sell, 100, 1);
         assert!(b.is_locked() && !b.is_crossed());
-        b.remove(ask);
-        b.add(3, Side::Sell, 99, 1);
+        b.remove(ask).unwrap();
+        add(&mut b, 3, Side::Sell, 99, 1);
         assert!(b.is_crossed() && !b.is_locked());
     }
 
     #[test]
     fn deep_levels_are_found_by_binary_search() {
         let mut b = Book::new();
-        let slots: Vec<u32> = (0..100u32)
-            .map(|i| b.add(u64::from(i), Side::Sell, 1000 + i, 1))
+        let slots: Vec<Handle> = (0..100u32)
+            .map(|i| add(&mut b, u64::from(i), Side::Sell, 1000 + i, 1))
             .collect();
         assert_eq!(b.best_ask(), Some(1000));
         // The deepest level is far outside the probe window.
         assert!(!b.at_best(slots[99]));
-        assert_eq!(b.remove(slots[99]), 1);
+        assert_eq!(b.remove(slots[99]), Ok(1));
         assert_eq!(b.level_count(Side::Sell), 99);
         b.audit().unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "reduce exceeds remaining quantity")]
-    fn over_reduce_panics() {
+    fn move_to_front_reorders_one_queue() {
         let mut b = Book::new();
-        let s = b.add(1, Side::Buy, 1, 1);
-        b.reduce(s, 2);
+        let s1 = add(&mut b, 1, Side::Buy, 10, 1);
+        let s2 = add(&mut b, 2, Side::Buy, 10, 2);
+        let s3 = add(&mut b, 3, Side::Buy, 10, 3);
+        let ids = |b: &Book| -> Vec<u64> { b.queue(Side::Buy, 10).map(|o| o.id).collect() };
+        b.move_to_front(s3).unwrap();
+        assert_eq!(ids(&b), [3, 1, 2]);
+        b.audit().unwrap();
+        b.move_to_front(s1).unwrap();
+        assert_eq!(ids(&b), [1, 3, 2]);
+        b.move_to_front(s1).unwrap();
+        assert_eq!(ids(&b), [1, 3, 2]);
+        b.audit().unwrap();
+        assert_eq!(b.front(Side::Buy), Some(s1));
+        assert!(b.at_head(s1) && !b.at_head(s2));
     }
 
     #[test]
     fn digest_depends_on_queue_order() {
         let mut a = Book::new();
-        a.add(1, Side::Buy, 10, 5);
-        a.add(2, Side::Buy, 10, 5);
+        add(&mut a, 1, Side::Buy, 10, 5);
+        add(&mut a, 2, Side::Buy, 10, 5);
         let mut b = Book::new();
-        b.add(2, Side::Buy, 10, 5);
-        b.add(1, Side::Buy, 10, 5);
+        add(&mut b, 2, Side::Buy, 10, 5);
+        add(&mut b, 1, Side::Buy, 10, 5);
         let da = digest_books([(1u64, &a)].into_iter());
         let db = digest_books([(1u64, &b)].into_iter());
         assert_ne!(da, db);

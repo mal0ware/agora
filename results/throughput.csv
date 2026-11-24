@@ -1,8 +1,0 @@
-pass,messages,seconds,million_messages_per_second,ns_per_message
-read_and_parse_only,268744780,4.944,54.354,18.4
-replay_run_1,268744780,54.649,4.918,203.4
-replay_run_2,268744780,54.905,4.895,204.3
-replay_run_3,268744780,49.086,5.475,182.6
-replay_median,268744780,54.649,4.918,203.4
-replay_with_checks,268744780,52.578,5.111,195.6
-replay_with_per_message_timing,268744780,64.597,4.160,240.4

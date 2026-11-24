@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use crate::book::{Book, Side};
+use crate::book::{Book, BookError, Handle, Side};
 
 /// One match between an incoming order and a resting order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,15 @@ pub enum EngineError {
         /// Quantity available.
         remaining: u32,
     },
+    /// The book refused a request the engine thought was valid. This would
+    /// be a fault in the engine.
+    Book(BookError),
+}
+
+impl From<BookError> for EngineError {
+    fn from(e: BookError) -> Self {
+        EngineError::Book(e)
+    }
 }
 
 impl std::fmt::Display for EngineError {
@@ -49,6 +58,7 @@ impl std::fmt::Display for EngineError {
             EngineError::ExceedsRemaining { asked, remaining } => {
                 write!(f, "asked for {asked} but only {remaining} remain")
             }
+            EngineError::Book(e) => write!(f, "book fault: {e}"),
         }
     }
 }
@@ -59,7 +69,7 @@ impl std::error::Error for EngineError {}
 #[derive(Debug, Clone, Default)]
 pub struct Engine {
     book: Book,
-    slots: HashMap<u64, u32>,
+    slots: HashMap<u64, Handle>,
 }
 
 impl Engine {
@@ -75,15 +85,18 @@ impl Engine {
 
     /// Remaining quantity of a resting order.
     pub fn remaining(&self, id: u64) -> Option<u32> {
-        self.slots.get(&id).map(|&s| self.book.get(s).qty)
+        self.slots
+            .get(&id)
+            .and_then(|&s| self.book.get(s))
+            .map(|o| o.qty)
     }
 
     /// Side and price of a resting order.
     pub fn resting(&self, id: u64) -> Option<(Side, u32)> {
-        self.slots.get(&id).map(|&s| {
-            let o = self.book.get(s);
-            (o.side, o.price)
-        })
+        self.slots
+            .get(&id)
+            .and_then(|&s| self.book.get(s))
+            .map(|o| (o.side, o.price))
     }
 
     /// Submit a limit order. Fills are appended to `fills` in the order they
@@ -109,7 +122,7 @@ impl Engine {
             let Some(slot) = self.book.front(against) else {
                 break;
             };
-            let resting = self.book.get(slot);
+            let resting = self.book.get(slot).ok_or(BookError::StaleHandle)?;
             let crosses = match side {
                 Side::Buy => resting.price <= price,
                 Side::Sell => resting.price >= price,
@@ -118,7 +131,7 @@ impl Engine {
                 break;
             }
             let traded = left.min(resting.qty);
-            let resting_remaining = self.book.reduce(slot, traded);
+            let resting_remaining = self.book.reduce(slot, traded)?;
             if resting_remaining == 0 {
                 self.slots.remove(&resting.id);
             }
@@ -131,7 +144,7 @@ impl Engine {
             });
         }
         if left > 0 {
-            let slot = self.book.add(id, side, price, left);
+            let slot = self.book.add(id, side, price, left)?;
             self.slots.insert(id, slot);
         }
         Ok(left)
@@ -144,14 +157,14 @@ impl Engine {
             return Err(EngineError::ZeroQty);
         }
         let slot = *self.slots.get(&id).ok_or(EngineError::UnknownId(id))?;
-        let remaining = self.book.get(slot).qty;
+        let remaining = self.book.get(slot).ok_or(BookError::StaleHandle)?.qty;
         if qty > remaining {
             return Err(EngineError::ExceedsRemaining {
                 asked: qty,
                 remaining,
             });
         }
-        let left = self.book.reduce(slot, qty);
+        let left = self.book.reduce(slot, qty)?;
         if left == 0 {
             self.slots.remove(&id);
         }
@@ -161,7 +174,7 @@ impl Engine {
     /// Remove a resting order. Returns the quantity it still had.
     pub fn delete(&mut self, id: u64) -> Result<u32, EngineError> {
         let slot = self.slots.remove(&id).ok_or(EngineError::UnknownId(id))?;
-        Ok(self.book.remove(slot))
+        Ok(self.book.remove(slot)?)
     }
 
     /// Cancel `old` and submit `new` on the same side with a new price and
@@ -182,9 +195,9 @@ impl Engine {
         if new != old && self.slots.contains_key(&new) {
             return Err(EngineError::DuplicateId(new));
         }
-        let side = self.book.get(slot).side;
+        let side = self.book.get(slot).ok_or(BookError::StaleHandle)?.side;
         self.slots.remove(&old);
-        self.book.remove(slot);
+        self.book.remove(slot)?;
         self.submit(new, side, price, qty, fills)
     }
 }

@@ -8,11 +8,8 @@
 //! that book is crossed, whether each execution took the oldest order at the
 //! best price, and at the end audits every book and balances the share ledger.
 
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
-
-use crate::book::{digest_books, Book, Side};
+use crate::book::{digest_books, Book, Handle, Side};
+use crate::index::{OrderIndex, RefIndex};
 use crate::itch::{Body, Message, Stock};
 
 /// 09:30:00 in nanoseconds since midnight.
@@ -23,34 +20,14 @@ pub const CLOSE_NS: u64 = 57_600_000_000_000;
 /// How many crossed episodes to keep as examples.
 const EXAMPLES: usize = 40;
 
-/// Hasher for order reference numbers: one multiply and one fold.
-#[derive(Default, Clone, Copy)]
-pub struct RefHasher(u64);
-
-impl Hasher for RefHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-
-    #[inline]
-    fn write_u64(&mut self, v: u64) {
-        let x = v.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        self.0 = x ^ (x >> 32);
-    }
+/// Where one order rests: which stock's book, and its handle there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resting {
+    /// Handle in that stock's book.
+    pub handle: Handle,
+    /// Stock locate.
+    pub locate: u16,
 }
-
-type RefMap = HashMap<u64, u64, BuildHasherDefault<RefHasher>>;
-
-/// The order reference index: a hash map from reference to stock and slot.
-pub type RefIndex = RefMap;
 
 /// Counters kept while replaying.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +58,9 @@ pub struct Stats {
     pub locate_mismatch: u64,
     /// Adds or replaces with zero shares.
     pub zero_share_add: u64,
+    /// Times a book refused a request the replay thought was valid. Always
+    /// zero unless the order index and a book have fallen out of step.
+    pub book_faults: u64,
     /// Largest number of orders resting at once across all books.
     pub peak_live_orders: u64,
     /// Printable executed shares: `E`, printable `C`, and `P`.
@@ -147,6 +127,7 @@ impl Default for Stats {
             over_reduce: 0,
             locate_mismatch: 0,
             zero_share_add: 0,
+            book_faults: 0,
             peak_live_orders: 0,
             printed_shares: 0,
             cross_shares: 0,
@@ -272,13 +253,16 @@ fn session(ts: u64) -> usize {
 }
 
 /// Replays ITCH messages into one book per stock locate.
-pub struct Replay {
+///
+/// `I` is the order reference index. Leave it alone to get the page table;
+/// [`Replay::with_index`] picks another, which only the benchmark does.
+pub struct Replay<I = RefIndex<Resting>> {
     policy: ReplacePolicy,
     books: Vec<Book>,
     symbols: Vec<Stock>,
     states: Vec<u8>,
     cross: Vec<CrossState>,
-    refs: RefMap,
+    refs: I,
     check: bool,
     /// Counters.
     pub stats: Stats,
@@ -290,13 +274,20 @@ impl Replay {
     /// A replay with no books. `check` turns on the per-update invariant
     /// checks; without it only the books and the cheap counters are kept.
     pub fn new(check: bool) -> Self {
+        Self::with_index(check)
+    }
+}
+
+impl<I: OrderIndex<Resting>> Replay<I> {
+    /// A replay with no books, on the order reference index `I`.
+    pub fn with_index(check: bool) -> Self {
         Replay {
             policy: ReplacePolicy::BackOfQueue,
             books: Vec::new(),
             symbols: Vec::new(),
             states: Vec::new(),
             cross: Vec::new(),
-            refs: RefMap::default(),
+            refs: I::default(),
             check,
             stats: Stats::default(),
             examples: Vec::new(),
@@ -319,23 +310,27 @@ impl Replay {
         shares: u32,
         price: u32,
     ) -> bool {
-        let Some(&packed) = self.refs.get(&old_ref) else {
+        let Some(resting) = self.refs.get(old_ref) else {
             return false;
         };
-        let locate = (packed >> 32) as usize;
-        let slot = packed as u32;
-        let old = self.books[locate].get(slot);
-        if price != old.price || shares == 0 || shares > old.qty || self.refs.contains_key(&new_ref)
-        {
+        let locate = usize::from(resting.locate);
+        let Some(old) = self.books[locate].get(resting.handle) else {
+            return false;
+        };
+        if price != old.price || shares == 0 || shares > old.qty || self.refs.contains(new_ref) {
             return false;
         }
         if locate != usize::from(m.header.locate) {
             self.stats.locate_mismatch += 1;
         }
-        self.books[locate].reduce(slot, old.qty - shares);
-        self.books[locate].set_id(slot, new_ref);
-        self.refs.remove(&old_ref);
-        self.refs.insert(new_ref, packed);
+        let book = &mut self.books[locate];
+        if book.reduce(resting.handle, old.qty - shares).is_err()
+            || book.set_id(resting.handle, new_ref).is_err()
+        {
+            self.stats.book_faults += 1;
+        }
+        self.refs.remove(old_ref);
+        self.refs.insert(new_ref, resting);
         self.stats.shares_replaced += u64::from(old.qty);
         self.stats.shares_added += u64::from(shares);
         self.stats.orders_added += 1;
@@ -378,17 +373,19 @@ impl Replay {
         self.books.iter().enumerate().map(|(i, b)| (i as u16, b))
     }
 
-    /// Where an order rests: its stock locate and slot.
-    pub fn locate_order(&self, order_ref: u64) -> Option<(u16, u32)> {
-        self.refs
-            .get(&order_ref)
-            .map(|&p| ((p >> 32) as u16, p as u32))
+    /// Where an order rests, if it does.
+    pub fn locate_order(&self, order_ref: u64) -> Option<Resting> {
+        self.refs.get(order_ref)
     }
 
-    /// Move an order to the front of its queue (analysis only).
-    pub fn promote(&mut self, order_ref: u64) {
-        if let Some((loc, slot)) = self.locate_order(order_ref) {
-            self.books[usize::from(loc)].move_to_front(slot);
+    /// Move an order to the front of the queue at its price. Used only by
+    /// the queue-priority analysis; a replay never does this by itself.
+    pub fn promote(&mut self, order_ref: u64) -> bool {
+        match self.refs.get(order_ref) {
+            Some(r) => self.books[usize::from(r.locate)]
+                .move_to_front(r.handle)
+                .is_ok(),
+            None => false,
         }
     }
 
@@ -461,14 +458,23 @@ impl Replay {
             self.stats.zero_share_add += 1;
             return;
         }
-        match self.refs.entry(order_ref) {
-            Entry::Occupied(_) => {
-                self.stats.duplicate_ref += 1;
-                return;
+        if self.refs.contains(order_ref) {
+            self.stats.duplicate_ref += 1;
+            return;
+        }
+        match self.books[locate].add(order_ref, side, price, shares) {
+            Ok(handle) => {
+                self.refs.insert(
+                    order_ref,
+                    Resting {
+                        handle,
+                        locate: locate as u16,
+                    },
+                );
             }
-            Entry::Vacant(v) => {
-                let slot = self.books[locate].add(order_ref, side, price, shares);
-                v.insert(((locate as u64) << 32) | u64::from(slot));
+            Err(_) => {
+                self.stats.book_faults += 1;
+                return;
             }
         }
         self.stats.orders_added += 1;
@@ -487,17 +493,21 @@ impl Replay {
     /// reference is unknown.
     #[inline]
     fn reduce(&mut self, m: &Message, order_ref: u64, shares: Option<u32>) -> Option<(u32, Side)> {
-        let Some(&packed) = self.refs.get(&order_ref) else {
+        let Some(resting) = self.refs.get(order_ref) else {
             self.stats.unknown_ref += 1;
             return None;
         };
-        let locate = (packed >> 32) as usize;
-        let slot = packed as u32;
+        let locate = usize::from(resting.locate);
+        let slot = resting.handle;
         if locate != usize::from(m.header.locate) {
             self.stats.locate_mismatch += 1;
         }
         let book = &mut self.books[locate];
-        let order = book.get(slot);
+        let Some(order) = book.get(slot) else {
+            self.stats.book_faults += 1;
+            self.refs.remove(order_ref);
+            return None;
+        };
         if self.check {
             match m.body {
                 Body::OrderExecuted { .. } => {
@@ -535,13 +545,75 @@ impl Replay {
             Some(s) => s,
             None => order.qty,
         };
-        if book.reduce(slot, take) == 0 {
-            self.refs.remove(&order_ref);
+        match book.reduce(slot, take) {
+            Ok(0) => {
+                self.refs.remove(order_ref);
+            }
+            Ok(_) => {}
+            Err(_) => self.stats.book_faults += 1,
         }
         if self.check {
             self.after_update(locate, m.header.timestamp, m.type_byte());
         }
         Some((take, order.side))
+    }
+
+    /// The order reference a message will look up, if any.
+    #[inline]
+    fn target(m: &Message) -> Option<u64> {
+        match m.body {
+            Body::OrderExecuted { order_ref, .. }
+            | Body::OrderExecutedWithPrice { order_ref, .. }
+            | Body::OrderCancel { order_ref, .. }
+            | Body::OrderDelete { order_ref } => Some(order_ref),
+            Body::OrderReplace { old_ref, .. } => Some(old_ref),
+            _ => None,
+        }
+    }
+
+    /// First hint for a message that will be applied soon: start loading the
+    /// index entries it needs. None of the three hints changes any state, so
+    /// a replay gives the same books with or without them.
+    #[inline]
+    pub fn prefetch_index(&self, m: &Message) {
+        match m.body {
+            Body::AddOrder { order_ref, .. } => self.refs.prefetch(order_ref),
+            Body::OrderReplace {
+                old_ref, new_ref, ..
+            } => {
+                self.refs.prefetch(old_ref);
+                self.refs.prefetch(new_ref);
+            }
+            _ => {
+                if let Some(order_ref) = Self::target(m) {
+                    self.refs.prefetch(order_ref);
+                }
+            }
+        }
+    }
+
+    /// Second hint: look the order up and start loading it.
+    #[inline]
+    pub fn prefetch_order(&self, m: &Message) {
+        if let Some(r) = Self::target(m).and_then(|order_ref| self.refs.get(order_ref)) {
+            if let Some(book) = self.books.get(usize::from(r.locate)) {
+                book.prefetch(r.handle);
+            }
+        }
+    }
+
+    /// Third hint, for messages that may remove the order: start loading its
+    /// neighbours in the queue.
+    #[inline]
+    pub fn prefetch_links(&self, m: &Message) {
+        if matches!(m.body, Body::OrderCancel { .. }) {
+            return;
+        }
+        if let Some(r) = Self::target(m).and_then(|order_ref| self.refs.get(order_ref)) {
+            if let Some(book) = self.books.get(usize::from(r.locate)) {
+                book.prefetch_links(r.handle);
+            }
+        }
     }
 
     /// Apply one message.

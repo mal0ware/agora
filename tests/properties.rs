@@ -5,11 +5,16 @@
 //! - The parser round-trips every message and never panics on arbitrary bytes.
 //! - Replay of generated streams rebuilds the generator's books, and replay of
 //!   arbitrary (mostly invalid) order messages still balances its ledger.
+//! - The order reference index agrees with a hash map.
+//! - A book driven with stale handles refuses them and stays sound.
 
-use agora::book::Side;
+use std::collections::HashMap;
+
+use agora::book::{Book, BookError, Handle, Side};
 use agora::engine::{Engine, Fill};
+use agora::index::{HashIndex, OrderIndex, RefIndex, DIRECT_LIMIT};
 use agora::itch::{message_len, parse, Body, FrameReader, Header, Message};
-use agora::replay::Replay;
+use agora::replay::{Replay, Resting};
 use agora::synth::{generate, SynthConfig};
 use proptest::prelude::*;
 
@@ -577,5 +582,156 @@ proptest! {
         prop_assert!(audit.conserved());
         prop_assert_eq!(replay.live_orders() as u64, audit.resting_orders);
         prop_assert_eq!(replay.stats.messages, messages.len() as u64);
+    }
+}
+
+// ----------------------------------------------------------------- index --
+
+fn index_key() -> impl Strategy<Value = u64> {
+    // Keys that share pages, keys on page edges, and keys past the page
+    // table's limit, drawn from small sets so that they collide.
+    prop_oneof![
+        4 => 0u64..64,
+        2 => (0u64..4).prop_map(|p| p * 4096 + 4095),
+        2 => (0u64..4).prop_map(|p| p * 4096),
+        1 => (0u64..8).prop_map(|k| DIRECT_LIMIT - 4 + k),
+        1 => (0u64..4).prop_map(|k| u64::MAX - k),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn ref_index_agrees_with_a_hash_map(ops in prop::collection::vec((0u8..3, index_key(), any::<u32>()), 0..400)) {
+        let mut index: RefIndex<u32> = RefIndex::new();
+        let mut hashed: HashIndex<u32> = HashIndex::default();
+        let mut model: HashMap<u64, u32> = HashMap::new();
+        for (op, key, value) in ops {
+            match op {
+                0 => {
+                    let was = model.insert(key, value);
+                    prop_assert_eq!(index.insert(key, value), was);
+                    prop_assert_eq!(OrderIndex::insert(&mut hashed, key, value), was);
+                }
+                1 => {
+                    let was = model.remove(&key);
+                    prop_assert_eq!(index.remove(key), was);
+                    prop_assert_eq!(OrderIndex::remove(&mut hashed, key), was);
+                }
+                _ => {
+                    index.prefetch(key);
+                    let is = model.get(&key).copied();
+                    prop_assert_eq!(index.get(key), is);
+                    prop_assert_eq!(OrderIndex::get(&hashed, key), is);
+                    prop_assert_eq!(OrderIndex::contains(&hashed, key), is.is_some());
+                }
+            }
+            prop_assert_eq!(index.len(), model.len());
+            prop_assert_eq!(OrderIndex::len(&hashed), model.len());
+        }
+        for (key, value) in &model {
+            prop_assert_eq!(index.get(*key), Some(*value));
+        }
+        for key in model.keys() {
+            index.remove(*key);
+        }
+        prop_assert!(index.is_empty());
+        prop_assert_eq!(index.pages_in_use(), 0);
+    }
+}
+
+// ------------------------------------------------------------------ book --
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Drive a book with handles that are sometimes stale. Every call either
+    /// does what a list of live orders says it should or is refused, and the
+    /// book passes its audit after each one.
+    #[test]
+    fn stale_handles_never_corrupt_a_book(ops in prop::collection::vec((0u8..4, any::<usize>(), 0u32..40, 95u32..100), 1..300)) {
+        let mut book = Book::new();
+        // Every handle ever issued, with what its order has left (0 = gone).
+        let mut issued: Vec<(Handle, u32)> = Vec::new();
+        let mut next_id = 0u64;
+        for (op, pick, qty, price) in ops {
+            if op == 0 || issued.is_empty() {
+                next_id += 1;
+                let side = if price < 97 { Side::Buy } else { Side::Sell };
+                match book.add(next_id, side, price, qty) {
+                    Ok(h) => {
+                        prop_assert!(qty > 0);
+                        issued.push((h, qty));
+                    }
+                    Err(e) => {
+                        prop_assert_eq!(e, BookError::ZeroQuantity);
+                        prop_assert_eq!(qty, 0);
+                    }
+                }
+            } else {
+                let i = pick % issued.len();
+                let (h, left) = issued[i];
+                let result = if op == 1 { book.reduce(h, qty) } else { book.remove(h) };
+                if left == 0 {
+                    prop_assert_eq!(result, Err(BookError::StaleHandle));
+                    prop_assert_eq!(book.get(h), None);
+                } else if op == 1 && qty > left {
+                    prop_assert_eq!(result, Err(BookError::ExceedsRemaining { asked: qty, remaining: left }));
+                } else if op == 1 {
+                    prop_assert_eq!(result, Ok(left - qty));
+                    issued[i].1 = left - qty;
+                } else {
+                    prop_assert_eq!(result, Ok(left));
+                    issued[i].1 = 0;
+                }
+            }
+            prop_assert!(book.audit().is_ok(), "{:?}", book.audit());
+            let live: u64 = issued.iter().map(|(_, q)| u64::from(*q)).sum();
+            prop_assert_eq!(book.resting_qty(), live);
+            prop_assert_eq!(book.order_count(), issued.iter().filter(|(_, q)| *q > 0).count());
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// The prefetch hints read and never write: a replay that issues them a
+    /// batch ahead ends with the same books and the same counters.
+    #[test]
+    fn prefetch_hints_change_nothing(seed in any::<u64>(), messages in 200u64..3000, batch in 1usize..40) {
+        let synth = generate(&SynthConfig { seed, messages, symbols: 3 });
+        let plain = replay_bytes(&synth.bytes, true);
+        let mut parsed = Vec::new();
+        let mut reader = FrameReader::new(&synth.bytes[..]);
+        while let Some(frame) = reader.next_frame().unwrap() {
+            parsed.push(parse(frame).unwrap());
+        }
+        let mut hinted = Replay::new(true);
+        for chunk in parsed.chunks(batch) {
+            for m in chunk {
+                hinted.prefetch_index(m);
+            }
+            for m in chunk {
+                hinted.prefetch_order(m);
+            }
+            for m in chunk {
+                hinted.prefetch_links(m);
+            }
+            for m in chunk {
+                hinted.apply(m);
+            }
+        }
+        // The first version's hash map index builds the same books too.
+        let mut hashed: Replay<HashIndex<Resting>> = Replay::with_index(true);
+        for m in &parsed {
+            hashed.apply(m);
+        }
+        prop_assert_eq!(hashed.digest(), plain.digest());
+        prop_assert_eq!(&hashed.stats, &plain.stats);
+        prop_assert_eq!(hinted.digest(), plain.digest());
+        prop_assert_eq!(hinted.digest(), synth.digest);
+        prop_assert_eq!(&hinted.stats, &plain.stats);
     }
 }
