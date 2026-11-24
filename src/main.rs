@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use agora::hist::{ticks, Calibration, Histogram};
 use agora::itch::{parse, Body, FrameReader, TYPES};
-use agora::pin::pin_to_cpu;
+use agora::pin::{busy_cpus, machine_cpu_times, pin_to_cpu};
 use agora::replay::{Audit, RefIndex, ReplacePolicy, Replay, Stats};
 use agora::report::{self, LatencyRow};
 use agora::synth::{generate, SynthConfig};
@@ -575,6 +575,7 @@ fn reproduce_full(data: &Path, out: &Path, runs: usize, cpu: usize) -> Res<()> {
     }
     let file_bytes = fs::metadata(data)?.len();
     fs::create_dir_all(out)?;
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
     let pinned = pin_to_cpu(cpu);
     println!("pinned to cpu {cpu}: {pinned}");
 
@@ -599,6 +600,7 @@ fn reproduce_full(data: &Path, out: &Path, runs: usize, cpu: usize) -> Res<()> {
 
     // Timed rounds. Each round runs every pass once, so slow drift on the
     // machine lands on all of them alike.
+    let load_before = machine_cpu_times();
     let mut times: Vec<Vec<f64>> = vec![Vec::new(); PASSES.len()];
     let mut latency = None;
     for round in 1..=runs {
@@ -624,6 +626,11 @@ fn reproduce_full(data: &Path, out: &Path, runs: usize, cpu: usize) -> Res<()> {
         );
     }
     let (hists, ns_per_tick, floor) = latency.ok_or("no rounds were run")?;
+    // What the whole machine did during the timed rounds, less this thread.
+    let other_load = match (load_before, machine_cpu_times()) {
+        (Some(a), Some(b)) => Some((busy_cpus(a, b, cpus) - 1.0).max(0.0)),
+        _ => None,
+    };
 
     println!("first-million pass ...");
     let mut first = replay_pass(data, true, 1_000_000)?;
@@ -681,6 +688,11 @@ fn reproduce_full(data: &Path, out: &Path, runs: usize, cpu: usize) -> Res<()> {
         },
     );
     row("rounds", runs.to_string());
+    row("logical_cpus", cpus.to_string());
+    row(
+        "other_load_in_cpus_during_timed_rounds",
+        other_load.map_or("not measured".into(), |l| format!("{l:.2}")),
+    );
     row(
         "replay_median_ns_per_message",
         format!("{:.1}", per_message(medians[3])),
