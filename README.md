@@ -1,5 +1,7 @@
 # Agora
 
+[![ci](https://github.com/mal0ware/agora/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mal0ware/agora/actions/workflows/ci.yml)
+
 A limit order book in Rust that rebuilds a full Nasdaq trading day from the exchange's own messages. The agora was the Greek marketplace.
 
 ## The question
